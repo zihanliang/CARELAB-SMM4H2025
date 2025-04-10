@@ -681,14 +681,14 @@ def main():
         num_train_epochs=epochs,
         weight_decay=0.01,
         logging_steps=100,
-        save_total_limit=2,
+        save_total_limit=1,
         load_best_model_at_end=True,
         metric_for_best_model="f1",
         warmup_steps=warmup_steps,
         seed=seed,
-        gradient_accumulation_steps=2,  # For larger effective batch size
-        fp16=True,  # Use mixed precision training
-        report_to="none",  # Disable reporting to Weights & Biases
+        gradient_accumulation_steps=2,
+        fp16=True,
+        report_to="none",
     )
 
     # Initialize model (could use custom architecture)
