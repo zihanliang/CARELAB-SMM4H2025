@@ -655,7 +655,7 @@ def main():
 
     # Initialize tokenizer
     print(f"Loading tokenizer: {model_name}")
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer = AutoTokenizer.from_pretrained("microsoft/deberta-v3-large", use_fast=True)
     
     # Tokenize data & align labels
     print("Tokenizing and aligning labels...")
@@ -674,8 +674,6 @@ def main():
     # Define training parameters
     training_args = TrainingArguments(
         output_dir=output_dir,
-        evaluation_strategy="epoch",
-        save_strategy="epoch",
         learning_rate=learning_rate,
         per_device_train_batch_size=batch_size,
         per_device_eval_batch_size=batch_size,
@@ -683,7 +681,7 @@ def main():
         weight_decay=0.01,
         logging_steps=100,
         save_total_limit=1,
-        load_best_model_at_end=True,
+        load_best_model_at_end=False,  # 关闭自动选择最佳模型
         metric_for_best_model="f1",
         warmup_steps=warmup_steps,
         seed=seed,
@@ -719,7 +717,6 @@ def main():
         compute_metrics=compute_metrics,
         tokenizer=tokenizer,
         data_collator=data_collator,
-        callbacks=[early_stopping]
     )
 
     # Start training
