@@ -624,6 +624,7 @@ def compute_event_level_metrics(predictions, labels):
 
 def main():
     # Data paths
+    global labels
     train_path = "SMM4H-2025-Task5-Train_subtask2.csv"
     val_path = "SMM4H-2025-Task5-Validation_subtask2.csv"
 
