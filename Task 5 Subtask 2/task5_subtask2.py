@@ -663,8 +663,8 @@ def main():
     val_dataset = val_dataset.map(tokenize_fn, batched=True)
 
     # Set format for pytorch
-    train_dataset.set_format("torch", columns=["input_ids", "attention_mask", "labels"])
-    val_dataset.set_format("torch", columns=["input_ids", "attention_mask", "labels"])
+    train_dataset.set_format("torch", columns=["input_ids", "attention_mask", "labels", "text"])
+    val_dataset.set_format("torch", columns=["input_ids", "attention_mask", "labels", "text"])
 
     # Calculate training steps for scheduler
     total_steps = (len(train_dataset) // batch_size) * epochs
