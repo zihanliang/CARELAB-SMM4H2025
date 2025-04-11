@@ -12,15 +12,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
-# Import the required modules for transformers, accelerate, and sklearn
-from transformers import TrainingArguments, Trainer, AutoTokenizer, AutoModel
+# Import required modules for transformers, accelerate, and sklearn
+from transformers import TrainingArguments, Trainer, AutoTokenizer, AutoModel, AutoConfig, AutoModelForTokenClassification
 from transformers.trainer_utils import IntervalStrategy, SaveStrategy
 from accelerate import Accelerator
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support, classification_report
 from sklearn.utils.class_weight import compute_class_weight
 from dataclasses import field
 
-# Monkey patch: Modify the __init__ and __post_init__ of TrainingArguments
+# Monkey patch: Modify __init__ and __post_init__ of TrainingArguments
 try:
     _orig_trainargs_init = TrainingArguments.__init__
     def _patched_trainargs_init(self, *args, **kwargs):
@@ -106,35 +106,17 @@ except Exception as e:
     print("Error while patching AcceleratorState._reset_state:", e)
 
 # -------------------------------------------------------------------
-# The following is the complete code for model training and evaluation
-# (Utilizing larger models and advanced statistical methods to enhance performance)
+# Define labels, data loading, and utility functions
 # -------------------------------------------------------------------
-import json
-import pandas as pd
-import numpy as np
 from collections import defaultdict, Counter
 from tqdm import tqdm
-import torch
-import torch.nn.functional as F
-from transformers import (
-    AutoTokenizer,
-    AutoModelForTokenClassification,
-    AutoConfig,
-    TrainingArguments,
-    Trainer,
-    DataCollatorForTokenClassification
-)
-from datasets import Dataset
 import evaluate
 import matplotlib.pyplot as plt
 from sklearn.metrics import confusion_matrix, classification_report
 
-# The following requires installing torchcrf: pip install pytorch-crf
+# Requires torchcrf: pip install pytorch-crf
 from TorchCRF import CRF
 
-###################################
-# 1. Define labels, data loading, and utility functions
-###################################
 labels = [
     "O", 
     "B-TARGET_ORG", "I-TARGET_ORG", 
@@ -162,7 +144,7 @@ def load_data(train_path, val_path):
     return train_df, val_df
 
 def preprocess_dataframe(df):
-    # Perform additional data cleaning if necessary, currently returning as is
+    # Additional data cleaning if necessary; here we simply return the dataframe
     return df
 
 def find_all_occurrences(text, substring):
@@ -179,8 +161,8 @@ def find_all_occurrences(text, substring):
 
 def get_entities_from_example(example):
     """
-    For each non-empty column in the CSV and based on the predefined mapping from column to entity,
-    return a list of entities formatted as {"start": start position, "end": end position, "label": entity type}
+    For each non-empty column in the CSV and based on the predefined column-to-entity mapping,
+    return a list of entities as {"start": start position, "end": end position, "label": entity type}
     """
     entities = []
     text = example["text"]
@@ -198,10 +180,9 @@ def get_entities_from_example(example):
     return entities
 
 ###################################
-# 2. Tokenization and label alignment
+# Tokenization and label alignment
 ###################################
 def tokenize_and_align_labels(examples):
-    # Specify batch_size to avoid processing too much data at one time
     tokenized_inputs = tokenizer(examples["text"], truncation=True, return_offsets_mapping=True, max_length=512)
     all_labels = []
     for i, offsets in enumerate(tokenized_inputs["offset_mapping"]):
@@ -231,11 +212,12 @@ def tokenize_and_align_labels(examples):
     return tokenized_inputs
 
 ###################################
-# 3. Sequence labeling helper functions
+# Sequence labeling helper functions
 ###################################
 def extract_event(predicted_labels, tokens):
     """
-    Concatenate token sequences into entities based on the BIO rules, returning a dictionary like {entity type: [entity text, ...]}
+    Concatenate token sequences into entities according to BIO rules,
+    returning a dictionary {entity type: [entity text, ...]}.
     """
     event = defaultdict(list)
     current_entity = None
@@ -259,7 +241,7 @@ def extract_event(predicted_labels, tokens):
 
 def convert_gold_to_event(example):
     """
-    Convert ground truth annotations into the format {entity type: [entity text, ...]}
+    Convert the gold-standard annotations into {entity type: [entity text, ...]} format.
     """
     text = example["text"]
     entities = get_entities_from_example(example)
@@ -273,7 +255,7 @@ def convert_gold_to_event(example):
 
 def events_exact_match(pred_event, gold_event):
     """
-    Return True if the predicted event and the ground truth event match exactly in both entity type and entity text sets
+    Return True if the predicted event and gold event are exactly matched in both entity types and text sets.
     """
     if set(pred_event.keys()) != set(gold_event.keys()):
         return False
@@ -283,37 +265,32 @@ def events_exact_match(pred_event, gold_event):
     return True
 
 ###################################
-# 4. Custom Advanced TokenClassification model
-#    Supports CRF layer and multiple loss types ("crf", "focal", "ce")
+# Custom Advanced TokenClassification model
+# Supports CRF layer and multiple loss types ("crf", "focal", "ce")
 ###################################
 from transformers.modeling_outputs import TokenClassifierOutput
-from transformers import AutoModelForTokenClassification
 
 class AdvancedTokenClassificationModel(AutoModelForTokenClassification):
     def __init__(self, config):
         super().__init__(config)
-        # Default parameters, can be overridden during from_pretrained
+        # Default parameters; can be overridden during from_pretrained
         self.class_weights = torch.ones(config.num_labels)
-        self.loss_type = "crf"  # Default using CRF; can be changed to "focal" or "ce"
+        self.loss_type = "crf"  # Default using CRF; can be set to "focal" or "ce"
         self.gamma = 2.0
         self.label_smoothing = 0.0
-        # If CRF is used, initialize the CRF layer (always pass the number of labels)
         if self.loss_type == "crf":
             self.crf = CRF(config.num_labels)
         else:
             self.crf = None
-        # Enable gradient checkpointing to reduce memory consumption
         self.config.gradient_checkpointing = True
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
-        # Pop custom parameters to prevent passing them to the parent __init__
         class_weights = kwargs.pop("class_weights", None)
         loss_type = kwargs.pop("loss_type", "crf")
         gamma = kwargs.pop("gamma", 2.0)
         label_smoothing = kwargs.pop("label_smoothing", 0.0)
         model = super(AdvancedTokenClassificationModel, cls).from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
-        # Set custom parameters
         model.class_weights = class_weights if class_weights is not None else torch.ones(model.config.num_labels)
         model.loss_type = loss_type
         model.gamma = gamma
@@ -326,12 +303,12 @@ class AdvancedTokenClassificationModel(AutoModelForTokenClassification):
 
     def forward(self, input_ids=None, attention_mask=None, labels=None, **kwargs):
         outputs = super().forward(input_ids=input_ids, attention_mask=attention_mask, labels=None, **kwargs)
-        logits = outputs.logits  # shape: (batch_size, seq_len, num_labels)
+        logits = outputs.logits  # Shape: (batch_size, seq_len, num_labels)
         if labels is not None:
             if self.loss_type == "crf":
                 mask = labels.ne(-100)
                 tags = labels.clone()
-                tags[~mask] = 0  # Set ignore_index parts to 0
+                tags[~mask] = 0  # Set ignore_index portions to 0
                 crf_loss = - self.crf(logits, tags, mask=mask).mean()
                 return TokenClassifierOutput(loss=crf_loss, logits=logits)
             else:
@@ -340,7 +317,6 @@ class AdvancedTokenClassificationModel(AutoModelForTokenClassification):
         else:
             if self.loss_type == "crf":
                 mask = attention_mask.bool()
-                # Use viterbi_decode to obtain predictions
                 decoded_tags = self.crf.viterbi_decode(logits, mask)
                 return TokenClassifierOutput(logits=logits, hidden_states=decoded_tags)
             else:
@@ -348,7 +324,6 @@ class AdvancedTokenClassificationModel(AutoModelForTokenClassification):
 
     def compute_loss(self, model_outputs, labels):
         logits = model_outputs.logits  # (batch_size, seq_len, num_labels)
-        # Reshape using the number of labels specified in the config
         logits = logits.view(-1, self.config.num_labels)
         labels = labels.view(-1)
         valid_mask = labels.ne(-100)
@@ -376,34 +351,29 @@ class AdvancedTokenClassificationModel(AutoModelForTokenClassification):
             return loss_fct(logits, labels)
 
 ###################################
-# 5. Custom Adversarial Trainer (based on FGM adversarial training)
+# Custom Adversarial Trainer (based on FGM adversarial training)
 ###################################
 class AdversarialTrainer(Trainer):
-    def training_step(self, model, inputs, num_items):  # Note: Added num_items parameter
+    def training_step(self, model, inputs, num_items):
         model.train()
         inputs = self._prepare_inputs(inputs)
-        # Normal forward computation for loss
         loss = self.compute_loss(model, inputs)
         loss.backward()
-        # FGM adversarial training
         epsilon = 0.5
-        # Obtain the word embeddings of the RoBERTa model (adjust based on the model name)
         if hasattr(model, "roberta"):
             embed_layer = model.roberta.embeddings.word_embeddings
         else:
             embed_layer = model.base_model.embeddings.word_embeddings
-        # Backup the gradient direction and calculate the perturbation delta
         delta = epsilon * torch.sign(embed_layer.weight.grad)
         embed_layer.weight.data.add_(delta)
         adv_loss = self.compute_loss(model, inputs)
         adv_loss.backward()
-        # Restore parameters
         embed_layer.weight.data.sub_(delta)
         total_loss = loss + adv_loss
         return total_loss.detach()
 
 ###################################
-# 6. Helper function: Compute class weights (based on token-level statistics)
+# Helper: Compute class weights based on token-level distribution
 ###################################
 def compute_class_weights(dataset, num_labels):
     counter = Counter()
@@ -420,7 +390,7 @@ def compute_class_weights(dataset, num_labels):
     return weights
 
 ###################################
-# 7. Modify compute_metrics: Support outputs after CRF decoding
+# Metrics calculation for evaluation (using seqeval)
 ###################################
 def compute_metrics(p):
     predictions, labels_true = p
@@ -431,11 +401,9 @@ def compute_metrics(p):
         true_predictions = []
         for pred, label in zip(predictions, labels_true):
             pred_labels = []
-            label_list = []
             for p_idx, l_idx in zip(pred, label):
                 if l_idx != -100:
                     pred_labels.append(id2label[p_idx])
-                    label_list.append(id2label[l_idx])
             true_predictions.append(pred_labels)
     true_labels = []
     for label in labels_true:
@@ -454,10 +422,13 @@ def compute_metrics(p):
     }
 
 ###################################
-# 8. Main process: Training, evaluation, and advanced analysis (confusion matrix, classification report, etc.)
+# Main training process
 ###################################
+from datasets import Dataset
+from transformers import DataCollatorForTokenClassification
+
 if __name__ == "__main__":
-    # Data file paths
+    # File paths for training and validation CSVs
     train_path = "SMM4H-2025-Task5-Train_subtask2.csv"
     val_path = "SMM4H-2025-Task5-Validation_subtask2.csv"
     
@@ -471,46 +442,43 @@ if __name__ == "__main__":
     val_dataset = Dataset.from_pandas(val_df)
     
     ###################################
-    # 9. Initialize Tokenizer and model (using roberta-large)
+    # Initialize tokenizer and model (using roberta-large)
     ###################################
     model_name = "roberta-large"
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     
-    # Perform tokenization and label alignment on the data, avoiding loading too much data at once (set batch_size parameter)
     train_dataset = train_dataset.map(tokenize_and_align_labels, batched=True, batch_size=8, remove_columns=list(train_df.columns))
     val_dataset = val_dataset.map(tokenize_and_align_labels, batched=True, batch_size=8, remove_columns=list(val_df.columns))
     
-    # Compute class weights (based on token-level label distribution in the training set)
     class_weights = compute_class_weights(train_dataset, num_labels=len(labels))
     
-    # Load configuration and instantiate the custom model (enable CRF layer, loss_type="crf")
     config = AutoConfig.from_pretrained(
         model_name,
         num_labels=len(labels),
         id2label=id2label,
         label2id=label2id,
-        gradient_checkpointing=True  # Enable gradient checkpointing to reduce memory consumption
+        gradient_checkpointing=True
     )
     model = AdvancedTokenClassificationModel.from_pretrained(
         model_name,
         config=config,
         class_weights=class_weights,
-        loss_type="crf",      # Use CRF layer
+        loss_type="crf",
         gamma=2.0,
         label_smoothing=0.0
     )
     
     ###################################
-    # 10. Define training parameters and custom AdversarialTrainer
+    # Training parameters and trainer setup
     ###################################
     training_args = TrainingArguments(
         output_dir="./results",
         evaluation_strategy="epoch",
         save_strategy="epoch",
         learning_rate=1e-5,
-        per_device_train_batch_size=4,      # Reduce batch size per device
+        per_device_train_batch_size=4,
         per_device_eval_batch_size=4,
-        gradient_accumulation_steps=2,        # Use gradient accumulation to maintain effective batch size
+        gradient_accumulation_steps=2,
         num_train_epochs=10,
         weight_decay=0.01,
         warmup_steps=500,
@@ -518,12 +486,12 @@ if __name__ == "__main__":
         save_total_limit=2,
         load_best_model_at_end=True,
         metric_for_best_model="f1",
-        fp16=True                           # Enable mixed precision training to reduce GPU memory usage
+        fp16=True
     )
     
     data_collator = DataCollatorForTokenClassification(tokenizer)
     
-    # Clear the GPU cache before training
+    # Clear GPU cache before training
     torch.cuda.empty_cache()
     
     trainer = AdversarialTrainer(
@@ -536,152 +504,10 @@ if __name__ == "__main__":
         data_collator=data_collator
     )
     
-    ###################################
-    # 11. Start training and evaluation (Token-Level and Event-Level)
-    ###################################
+    # Begin training
     trainer.train()
     
-    # Token-Level evaluation
+    # Optionally conduct evaluation: Print token-level evaluation metrics
     metrics = trainer.evaluate()
     print("Token-Level Evaluation Metrics:")
     print(metrics)
-    
-    # Event-Level Exact Match evaluation
-    exact_match_count = 0
-    total_examples = len(val_df)
-    device = model.device
-    for i in tqdm(range(total_examples), desc="Evaluating event extraction"):
-        example = val_df.iloc[i]
-        text = example["text"]
-        inputs = tokenizer(text, return_tensors="pt", truncation=True)
-        inputs = {k: t.to(device) for k, t in inputs.items()}
-        with torch.no_grad():
-            outputs = model(**inputs)
-        # If using the CRF layer, predictions are in the hidden_states field
-        if model.loss_type == "crf":
-            pred_ids = outputs.hidden_states[0]  # decoded list-of-lists
-        else:
-            pred_ids = torch.argmax(outputs.logits, dim=2)[0].cpu().numpy().tolist()
-        tokens = tokenizer.convert_ids_to_tokens(inputs["input_ids"][0])
-        filtered_tokens = []
-        filtered_preds = []
-        for token, p in zip(tokens, pred_ids):
-            if token in tokenizer.all_special_tokens:
-                continue
-            if isinstance(p, int):
-                filtered_preds.append(id2label[p])
-            else:
-                filtered_preds.append(id2label[p])
-            filtered_tokens.append(token)
-        pred_event = extract_event(filtered_preds, filtered_tokens)
-        gold_event = convert_gold_to_event(example)
-        if events_exact_match(pred_event, gold_event):
-            exact_match_count += 1
-    event_exact_match_rate = exact_match_count / total_examples
-    print(f"Event-Level Exact Match Rate: {event_exact_match_rate:.4f}")
-    
-    ###################################
-    # 12. Advanced analysis: Confusion matrix and classification report (filter out the "O" label)
-    ###################################
-    flat_preds = []
-    flat_labels = []
-    for batch in trainer.get_eval_dataloader():
-        batch = {k: v.to(device) for k, v in batch.items()}
-        with torch.no_grad():
-            outputs = model(**batch)
-        if model.loss_type == "crf":
-            batch_preds = outputs.hidden_states[0]
-        else:
-            batch_preds = torch.argmax(outputs.logits, dim=-1).cpu().numpy()
-        labels_batch = batch["labels"].cpu().numpy()
-        if isinstance(batch_preds, list):
-            for pred_seq, l_seq in zip(batch_preds, labels_batch):
-                for p, l in zip(pred_seq, l_seq):
-                    if l != -100:
-                        flat_preds.append(p)
-                        flat_labels.append(l)
-        else:
-            for p_seq, l_seq in zip(batch_preds, labels_batch):
-                for p, l in zip(p_seq, l_seq):
-                    if l != -100:
-                        flat_preds.append(p)
-                        flat_labels.append(l)
-    filtered_preds, filtered_labels = [], []
-    o_id = label2id["O"]
-    for p, l in zip(flat_preds, flat_labels):
-        if p != o_id and l != o_id:
-            filtered_preds.append(p)
-            filtered_labels.append(l)
-    ALL_LABELS = [
-        "O", 
-        "B-TARGET_ORG", "I-TARGET_ORG", 
-        "B-PRODUCT", "I-PRODUCT", 
-        "B-INFECTION", "I-INFECTION", 
-        "B-SAFETY_INCIDENT", "I-SAFETY_INCIDENT", 
-        "B-AFFECTED_NUM", "I-AFFECTED_NUM",
-        "B-LOCATION", "I-LOCATION"
-    ]
-    entity_only = [lab for lab in ALL_LABELS if lab != "O"]
-    entity_ids = [label2id[lab] for lab in entity_only]
-    
-    cm_entities = confusion_matrix(filtered_labels, filtered_preds, labels=entity_ids)
-    print("\nConfusion Matrix (Gold, Pred ≠ O):")
-    print(cm_entities)
-    
-    print("\nClassification Report (Gold, Pred ≠ O):")
-    print(classification_report(
-        filtered_labels,
-        filtered_preds,
-        labels=entity_ids,
-        target_names=entity_only,
-        zero_division=0
-    ))
-    
-    ###################################
-    # 13. Entity-level (Chunk-Level) F1 evaluation (based on seqeval)
-    ###################################
-    preds = []
-    labels_true = []
-    for batch in trainer.get_eval_dataloader():
-        batch = {k: v.to(device) for k, v in batch.items()}
-        with torch.no_grad():
-            outputs = model(**batch)
-        if model.loss_type == "crf":
-            batch_preds = outputs.hidden_states[0]
-        else:
-            batch_preds = torch.argmax(outputs.logits, dim=-1).cpu().numpy()
-        labels_batch = batch["labels"].cpu().numpy()
-        preds.extend(batch_preds)
-        labels_true.extend(labels_batch)
-    
-    label_seqeval_preds = []
-    label_seqeval_trues = []
-    if isinstance(preds, list):
-        for pred_seq, label_seq in zip(preds, labels_true):
-            pred_labels_str = []
-            gold_labels_str = []
-            for p, l in zip(pred_seq, label_seq):
-                if l == -100:
-                    continue
-                pred_labels_str.append(id2label[p])
-                gold_labels_str.append(id2label[l])
-            label_seqeval_preds.append(pred_labels_str)
-            label_seqeval_trues.append(gold_labels_str)
-    else:
-        for pred_seq, label_seq in zip(preds, labels_true):
-            pred_labels_str = []
-            gold_labels_str = []
-            for p, l in zip(pred_seq, label_seq):
-                if l == -100:
-                    continue
-                pred_labels_str.append(id2label[p])
-                gold_labels_str.append(id2label[l])
-            label_seqeval_preds.append(pred_labels_str)
-            label_seqeval_trues.append(gold_labels_str)
-    seqeval_metric = evaluate.load("seqeval")
-    chunk_results = seqeval_metric.compute(
-        predictions=label_seqeval_preds,
-        references=label_seqeval_trues
-    )
-    print("\nChunk-Level (Entity-Level) Seqeval Results:")
-    print(chunk_results)
