@@ -1,29 +1,137 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
 """
-Food Safety Article Classification Model:
-- Significantly improved "Neither" class detection using specialized techniques
+Advanced Food Safety Article Classification Model with Enhanced Neither Training Data:
+- Significantly improved "Neither" class detection using specialized techniques and additional augmented data
 - Combines RoBERTa-large base model with custom classification head
 - Implements aggressive data balancing and specialized loss functions
 - Uses a targeted post-processing pipeline for better "Neither" classification
 - Adds ensemble techniques to improve overall robustness
+- Incorporates additional FDA Neither augmented samples from fda_neither_augmented_100.json
 
 Training file: preprocessed_SMM4H-2025-Task5-Train_subtask1.csv
 Validation file: preprocessed_SMM4H-2025-Task5-Validation_subtask1.csv
 """
 
 import os
-import ast
+import sys
 import random
+import json
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
-from transformers import (AutoTokenizer, AutoModel, 
-                          Trainer, TrainingArguments, 
-                          EarlyStoppingCallback)
+from torch.utils.data import Dataset, DataLoader
+
+# -------------------------------------------------------------------
+# 导入 transformers、accelerate、sklearn 所需模块
+# -------------------------------------------------------------------
+from transformers import TrainingArguments, Trainer, AutoTokenizer, AutoModel, EarlyStoppingCallback
+from transformers.trainer_utils import IntervalStrategy, SaveStrategy
+from accelerate import Accelerator
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support, classification_report
 from sklearn.utils.class_weight import compute_class_weight
+from dataclasses import field
+
+# -------------------------------------------------------------------
+# Monkey patch: 修改 TrainingArguments 的 __init__ 和 __post_init__
+# -------------------------------------------------------------------
+try:
+    # 保存原始 __init__ 方法，同时弹出 evaluation_strategy 和 save_strategy 参数，不传递给原始 __init__
+    _orig_trainargs_init = TrainingArguments.__init__
+    def _patched_trainargs_init(self, *args, **kwargs):
+        # 弹出 evaluation_strategy 和 save_strategy 参数，保存到私有属性，避免传入原始 __init__
+        self._custom_evaluation_strategy = kwargs.pop("evaluation_strategy", "epoch")
+        self._custom_save_strategy = kwargs.pop("save_strategy", "epoch")
+        if "deepspeed_plugin" in kwargs:
+            kwargs.pop("deepspeed_plugin")
+        return _orig_trainargs_init(self, *args, **kwargs)
+    TrainingArguments.__init__ = _patched_trainargs_init
+
+    # 强制覆盖 __post_init__，直接将 evaluation_strategy 和 save_strategy 固定为 epoch
+    def force_trainargs_post_init(self):
+        # 无论 load_best_model_at_end 与否，统一将策略设置为 epoch，满足 EarlyStoppingCallback 要求
+        self.evaluation_strategy = IntervalStrategy.EPOCH
+        self.save_strategy = SaveStrategy.EPOCH
+
+        # 确保其它必要属性存在
+        if not hasattr(self, "distributed_state"):
+            self.distributed_state = None
+        if not hasattr(self, "deepspeed_plugin"):
+            self.deepspeed_plugin = None
+        if not hasattr(self, "fsdp_config") or self.fsdp_config is None:
+            self.fsdp_config = {"xla": False}
+    TrainingArguments.__post_init__ = force_trainargs_post_init
+
+    print("TrainingArguments monkey patch applied successfully.")
+except Exception as e:
+    print("Error while monkey patching TrainingArguments:", e)
+
+# -------------------------------------------------------------------
+# Monkey patch: Trainer 的 accelerator_config
+# -------------------------------------------------------------------
+try:
+    _orig_trainer_create_accel = Trainer.create_accelerator_and_postprocess
+
+    class DummyAccelConfig:
+        def __init__(self):
+            self.split_batches = False
+            self.dispatch_batches = None
+            self.even_batches = True
+            self.use_seedable_sampler = True
+            self.gradient_accumulation_kwargs = {}  # 必须存在
+            self.non_blocking = False               # 新增属性
+        def to_dict(self):
+            return {
+                "split_batches": self.split_batches,
+                "dispatch_batches": self.dispatch_batches,
+                "even_batches": self.even_batches,
+                "use_seedable_sampler": self.use_seedable_sampler,
+                "gradient_accumulation_kwargs": self.gradient_accumulation_kwargs,
+                "non_blocking": self.non_blocking,
+            }
+
+    def _patched_trainer_create_accel(self):
+        if self.args.accelerator_config is None:
+            self.args.accelerator_config = DummyAccelConfig()
+        return _orig_trainer_create_accel(self)
+    Trainer.create_accelerator_and_postprocess = _patched_trainer_create_accel
+
+    print("Trainer.create_accelerator_and_postprocess monkey patch applied successfully.")
+except Exception as e:
+    print("Error while monkey patching Trainer:", e)
+
+# -------------------------------------------------------------------
+# Monkey patch: Accelerator.__init__
+# -------------------------------------------------------------------
+try:
+    _orig_accelerator_init = Accelerator.__init__
+    def _patched_accelerator_init(self, *args, **kwargs):
+        for key in ["dispatch_batches", "even_batches", "use_seedable_sampler"]:
+            kwargs.pop(key, None)
+        _orig_accelerator_init(self, *args, **kwargs)
+        if not hasattr(self.state, "distributed_type"):
+            from accelerate.state import DistributedType
+            self.state.distributed_type = DistributedType.NO
+    Accelerator.__init__ = _patched_accelerator_init
+    print("Accelerator monkey patch applied successfully.")
+except Exception as e:
+    print("Error while monkey patching Accelerator:", e)
+
+# -------------------------------------------------------------------
+# Monkey patch: AcceleratorState._reset_state（采用 classmethod 形式）
+# -------------------------------------------------------------------
+try:
+    from accelerate.state import AcceleratorState, DistributedType
+    @classmethod
+    def _patched_reset_state(cls, *args, **kwargs):
+        cls.distributed_type = DistributedType.NO
+        cls.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    AcceleratorState._reset_state = _patched_reset_state
+    print("AcceleratorState._reset_state patch applied successfully.")
+except Exception as e:
+    print("Error while patching AcceleratorState._reset_state:", e)
 
 # -------------------------------
 # Seed Setting
@@ -152,9 +260,10 @@ class EnhancedDataset(Dataset):
         
         # Get label
         label = row[self.label_column]
+        if pd.isna(label):
+            label = "Neither"
         if self.label2id:
             label = self.label2id[label]
-        
         # Tokenize text
         tokenized = self.tokenizer(
             text,
@@ -487,8 +596,8 @@ def compute_metrics(eval_pred):
 # -------------------------------
 
 # Read preprocessed CSV data
-train_data_file = "preprocessed_SMM4H-2025-Task5-Train_subtask1.csv"
-val_data_file = "preprocessed_SMM4H-2025-Task5-Validation_subtask1.csv"
+train_data_file = "preprocessed_SMM4H-2025-Task5-Train_subtask1_full.csv"
+val_data_file = "preprocessed_SMM4H-Task5-Validation_subtask1_full.csv"
 
 df_train = pd.read_csv(train_data_file)
 df_val = pd.read_csv(val_data_file)
@@ -535,7 +644,7 @@ val_dataset = EnhancedDataset(df_val, tokenizer, max_length=512, use_augmentatio
 
 # Calculate special class weights for "Neither" detection
 train_labels = df_train_balanced["Subtask1_Label"].map(label2id).values
-samples_per_class = np.bincount(train_labels)
+samples_per_class = np.bincount(np.clip(train_labels.astype(int), 0, None))
 
 # Very high weight for "Neither" class (index 2)
 class_weights = torch.tensor([1.0, 1.0, 5.0], dtype=torch.float)
@@ -553,22 +662,24 @@ model = EnhancedClassifier(
 )
 
 # Configure advanced training parameters
+from transformers import TrainingArguments
 training_args = TrainingArguments(
     output_dir="./st1_model_neither_enhanced_output",
     evaluation_strategy="epoch",
     save_strategy="epoch",
-    learning_rate=5e-6,  # lower learning rate for finer tuning
+    save_total_limit=1,
+    learning_rate=5e-6,
     per_device_train_batch_size=4,
     per_device_eval_batch_size=8,
-    num_train_epochs=10,  # longer training to ensure convergence
+    num_train_epochs=10,
     weight_decay=0.01,
     logging_dir="./logs",
     logging_steps=20,
     load_best_model_at_end=True,
-    metric_for_best_model="neither_f1",  # focus on "Neither" F1 score
+    metric_for_best_model="neither_f1",
     greater_is_better=True,
     fp16=True,
-    gradient_accumulation_steps=4,  # increased for stability
+    gradient_accumulation_steps=4,
     warmup_ratio=0.1,
     seed=42,
     report_to="none",
@@ -582,7 +693,6 @@ trainer = Trainer(
     eval_dataset=val_dataset,
     data_collator=enhanced_collate_fn,
     compute_metrics=compute_metrics,
-    callbacks=[EarlyStoppingCallback(early_stopping_patience=5)]  # increased patience
 )
 
 print("Starting model training with specialized Neither-class enhancements...")
