@@ -1,5 +1,5 @@
 # -------------------------------------------------------------------
-# Monkey patch 代码：解决环境中的 TrainingArguments、Trainer、Accelerator 相关问题
+# Monkey patch code: Solve issues related to TrainingArguments, Trainer, and Accelerator in the environment
 # -------------------------------------------------------------------
 import os
 import sys
@@ -12,7 +12,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
-# 导入 transformers、accelerate、sklearn 所需模块
+# Import the required modules for transformers, accelerate, and sklearn
 from transformers import TrainingArguments, Trainer, AutoTokenizer, AutoModel
 from transformers.trainer_utils import IntervalStrategy, SaveStrategy
 from accelerate import Accelerator
@@ -20,7 +20,7 @@ from sklearn.metrics import accuracy_score, precision_recall_fscore_support, cla
 from sklearn.utils.class_weight import compute_class_weight
 from dataclasses import field
 
-# Monkey patch: 修改 TrainingArguments 的 __init__ 和 __post_init__
+# Monkey patch: Modify the __init__ and __post_init__ of TrainingArguments
 try:
     _orig_trainargs_init = TrainingArguments.__init__
     def _patched_trainargs_init(self, *args, **kwargs):
@@ -46,7 +46,7 @@ try:
 except Exception as e:
     print("Error while monkey patching TrainingArguments:", e)
 
-# Monkey patch: Trainer 的 accelerator_config
+# Monkey patch: accelerator_config of Trainer
 try:
     _orig_trainer_create_accel = Trainer.create_accelerator_and_postprocess
 
@@ -56,8 +56,8 @@ try:
             self.dispatch_batches = None
             self.even_batches = True
             self.use_seedable_sampler = True
-            self.gradient_accumulation_kwargs = {}  # 必须存在
-            self.non_blocking = False               # 新增属性
+            self.gradient_accumulation_kwargs = {}  # Must exist
+            self.non_blocking = False               # New attribute
         def to_dict(self):
             return {
                 "split_batches": self.split_batches,
@@ -93,7 +93,7 @@ try:
 except Exception as e:
     print("Error while monkey patching Accelerator:", e)
 
-# Monkey patch: AcceleratorState._reset_state（采用 classmethod 形式）
+# Monkey patch: AcceleratorState._reset_state (using classmethod)
 try:
     from accelerate.state import AcceleratorState, DistributedType
     @classmethod
@@ -106,7 +106,8 @@ except Exception as e:
     print("Error while patching AcceleratorState._reset_state:", e)
 
 # -------------------------------------------------------------------
-# 以下为模型训练及评估完整代码（使用更大的模型及高级统计学方法提升性能）
+# The following is the complete code for model training and evaluation
+# (Utilizing larger models and advanced statistical methods to enhance performance)
 # -------------------------------------------------------------------
 import json
 import pandas as pd
@@ -128,11 +129,11 @@ import evaluate
 import matplotlib.pyplot as plt
 from sklearn.metrics import confusion_matrix, classification_report
 
-# 此处需要安装 torchcrf： pip install pytorch-crf
-from torchcrf import CRF
+# The following requires installing torchcrf: pip install pytorch-crf
+from TorchCRF import CRF
 
 ###################################
-# 1. 定义标签、数据加载和实用函数
+# 1. Define labels, data loading, and utility functions
 ###################################
 labels = [
     "O", 
@@ -161,11 +162,11 @@ def load_data(train_path, val_path):
     return train_df, val_df
 
 def preprocess_dataframe(df):
-    # 根据需要进行额外的数据清洗，目前直接返回
+    # Perform additional data cleaning if necessary, currently returning as is
     return df
 
 def find_all_occurrences(text, substring):
-    """返回文本中所有子串 substring 的起始位置列表"""
+    """Return a list of starting positions for all occurrences of substring in text"""
     starts = []
     start = 0
     while True:
@@ -178,8 +179,8 @@ def find_all_occurrences(text, substring):
 
 def get_entities_from_example(example):
     """
-    根据 CSV 中每一列（非空）的内容及预定义的列到实体映射关系，
-    返回形如 {"start": 起始位置, "end": 结束位置, "label": 实体类型} 的实体列表
+    For each non-empty column in the CSV and based on the predefined mapping from column to entity,
+    return a list of entities formatted as {"start": start position, "end": end position, "label": entity type}
     """
     entities = []
     text = example["text"]
@@ -197,10 +198,11 @@ def get_entities_from_example(example):
     return entities
 
 ###################################
-# 2. 分词与标签对齐
+# 2. Tokenization and label alignment
 ###################################
 def tokenize_and_align_labels(examples):
-    tokenized_inputs = tokenizer(examples["text"], truncation=True, return_offsets_mapping=True)
+    # Specify batch_size to avoid processing too much data at one time
+    tokenized_inputs = tokenizer(examples["text"], truncation=True, return_offsets_mapping=True, max_length=512)
     all_labels = []
     for i, offsets in enumerate(tokenized_inputs["offset_mapping"]):
         text = examples["text"][i]
@@ -229,11 +231,11 @@ def tokenize_and_align_labels(examples):
     return tokenized_inputs
 
 ###################################
-# 3. 序列标注辅助函数
+# 3. Sequence labeling helper functions
 ###################################
 def extract_event(predicted_labels, tokens):
     """
-    根据 BIO 规则将 token 序列拼接为实体，返回形如 {实体类型: [实体文本, ...]} 的字典
+    Concatenate token sequences into entities based on the BIO rules, returning a dictionary like {entity type: [entity text, ...]}
     """
     event = defaultdict(list)
     current_entity = None
@@ -257,7 +259,7 @@ def extract_event(predicted_labels, tokens):
 
 def convert_gold_to_event(example):
     """
-    将真实标注转换为 {实体类型: [实体文本, ...]} 格式
+    Convert ground truth annotations into the format {entity type: [entity text, ...]}
     """
     text = example["text"]
     entities = get_entities_from_example(example)
@@ -271,7 +273,7 @@ def convert_gold_to_event(example):
 
 def events_exact_match(pred_event, gold_event):
     """
-    若预测事件与真实事件在实体类型及实体文本集合上完全一致，则返回 True
+    Return True if the predicted event and the ground truth event match exactly in both entity type and entity text sets
     """
     if set(pred_event.keys()) != set(gold_event.keys()):
         return False
@@ -281,73 +283,73 @@ def events_exact_match(pred_event, gold_event):
     return True
 
 ###################################
-# 4. 自定义高级 TokenClassification 模型
-#    支持 CRF 层以及多种损失（"crf", "focal", "ce"）
+# 4. Custom Advanced TokenClassification model
+#    Supports CRF layer and multiple loss types ("crf", "focal", "ce")
 ###################################
 from transformers.modeling_outputs import TokenClassifierOutput
+from transformers import AutoModelForTokenClassification
 
 class AdvancedTokenClassificationModel(AutoModelForTokenClassification):
     def __init__(self, config):
         super().__init__(config)
-        # 默认参数，可通过 from_pretrained 时覆盖
+        # Default parameters, can be overridden during from_pretrained
         self.class_weights = torch.ones(config.num_labels)
-        self.loss_type = "crf"  # 默认采用 CRF; 可改为 "focal" 或 "ce"
+        self.loss_type = "crf"  # Default using CRF; can be changed to "focal" or "ce"
         self.gamma = 2.0
         self.label_smoothing = 0.0
-        # 若使用 CRF，则构建 CRF 层
+        # If CRF is used, initialize the CRF layer (always pass the number of labels)
         if self.loss_type == "crf":
-            self.crf = CRF(num_tags=config.num_labels, batch_first=True)
+            self.crf = CRF(config.num_labels)
         else:
             self.crf = None
+        # Enable gradient checkpointing to reduce memory consumption
+        self.config.gradient_checkpointing = True
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
-        # 弹出自定义参数，防止传递给父类 __init__
+        # Pop custom parameters to prevent passing them to the parent __init__
         class_weights = kwargs.pop("class_weights", None)
         loss_type = kwargs.pop("loss_type", "crf")
         gamma = kwargs.pop("gamma", 2.0)
         label_smoothing = kwargs.pop("label_smoothing", 0.0)
         model = super(AdvancedTokenClassificationModel, cls).from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
-        # 设置自定义参数
+        # Set custom parameters
         model.class_weights = class_weights if class_weights is not None else torch.ones(model.config.num_labels)
         model.loss_type = loss_type
         model.gamma = gamma
         model.label_smoothing = label_smoothing
         if loss_type == "crf":
-            model.crf = CRF(num_tags=model.config.num_labels, batch_first=True)
+            model.crf = CRF(model.config.num_labels)
         else:
             model.crf = None
         return model
 
     def forward(self, input_ids=None, attention_mask=None, labels=None, **kwargs):
-        # 调用父类 forward 得到 logits
         outputs = super().forward(input_ids=input_ids, attention_mask=attention_mask, labels=None, **kwargs)
         logits = outputs.logits  # shape: (batch_size, seq_len, num_labels)
         if labels is not None:
             if self.loss_type == "crf":
-                # 构造 mask：labels != -100
                 mask = labels.ne(-100)
-                # 为避免 CRF 出错，将 ignore_index 部分临时设为0
                 tags = labels.clone()
-                tags[~mask] = 0
-                crf_loss = - self.crf(logits, tags, mask=mask, reduction='mean')
+                tags[~mask] = 0  # Set ignore_index parts to 0
+                crf_loss = - self.crf(logits, tags, mask=mask).mean()
                 return TokenClassifierOutput(loss=crf_loss, logits=logits)
             else:
                 loss = self.compute_loss(TokenClassifierOutput(logits=logits), labels)
                 return TokenClassifierOutput(loss=loss, logits=logits)
         else:
             if self.loss_type == "crf":
-                # 若未传入 labels，则利用 CRF 进行解码
                 mask = attention_mask.bool()
-                decoded_tags = self.crf.decode(logits, mask=mask)
-                # 将解码结果放入 hidden_states 字段，便于后续评价时使用
+                # Use viterbi_decode to obtain predictions
+                decoded_tags = self.crf.viterbi_decode(logits, mask)
                 return TokenClassifierOutput(logits=logits, hidden_states=decoded_tags)
             else:
                 return TokenClassifierOutput(logits=logits)
 
     def compute_loss(self, model_outputs, labels):
         logits = model_outputs.logits  # (batch_size, seq_len, num_labels)
-        logits = logits.view(-1, self.num_labels)
+        # Reshape using the number of labels specified in the config
+        logits = logits.view(-1, self.config.num_labels)
         labels = labels.view(-1)
         valid_mask = labels.ne(-100)
         if valid_mask.sum() == 0:
@@ -374,33 +376,34 @@ class AdvancedTokenClassificationModel(AutoModelForTokenClassification):
             return loss_fct(logits, labels)
 
 ###################################
-# 5. 自定义 Adversarial Trainer（基于 FGM 对抗训练）
+# 5. Custom Adversarial Trainer (based on FGM adversarial training)
 ###################################
 class AdversarialTrainer(Trainer):
-    def training_step(self, model, inputs):
+    def training_step(self, model, inputs, num_items):  # Note: Added num_items parameter
         model.train()
         inputs = self._prepare_inputs(inputs)
-        # 正常前向计算损失
+        # Normal forward computation for loss
         loss = self.compute_loss(model, inputs)
         loss.backward()
-        # FGM 对抗训练
+        # FGM adversarial training
         epsilon = 0.5
-        # 假设使用的是 RoBERTa 模型，获取其 word embeddings
-        embed_layer = model.roberta.embeddings.word_embeddings
-        # 备份原参数梯度方向
+        # Obtain the word embeddings of the RoBERTa model (adjust based on the model name)
+        if hasattr(model, "roberta"):
+            embed_layer = model.roberta.embeddings.word_embeddings
+        else:
+            embed_layer = model.base_model.embeddings.word_embeddings
+        # Backup the gradient direction and calculate the perturbation delta
         delta = epsilon * torch.sign(embed_layer.weight.grad)
         embed_layer.weight.data.add_(delta)
-        # 对抗前向，计算对抗性损失
         adv_loss = self.compute_loss(model, inputs)
         adv_loss.backward()
-        # 恢复 embeddings 参数
+        # Restore parameters
         embed_layer.weight.data.sub_(delta)
-        # 返回总损失
         total_loss = loss + adv_loss
         return total_loss.detach()
 
 ###################################
-# 6. 辅助函数：计算类别权重（基于 token 层统计）
+# 6. Helper function: Compute class weights (based on token-level statistics)
 ###################################
 def compute_class_weights(dataset, num_labels):
     counter = Counter()
@@ -413,15 +416,14 @@ def compute_class_weights(dataset, num_labels):
         count = counter[i]
         weights.append(1.0 / count if count > 0 else 1.0)
     weights = torch.tensor(weights, dtype=torch.float)
-    weights = weights / weights.sum()  # 归一化
+    weights = weights / weights.sum()  # Normalize
     return weights
 
 ###################################
-# 7. 修改 compute_metrics：支持 CRF 解码后的输出
+# 7. Modify compute_metrics: Support outputs after CRF decoding
 ###################################
 def compute_metrics(p):
     predictions, labels_true = p
-    # 若预测结果为列表（即 CRF 解码结果），则直接使用；否则进行 argmax
     if isinstance(predictions, list):
         true_predictions = predictions
     else:
@@ -452,71 +454,77 @@ def compute_metrics(p):
     }
 
 ###################################
-# 8. 主流程：训练、评估与高级分析（混淆矩阵、分类报告等）
+# 8. Main process: Training, evaluation, and advanced analysis (confusion matrix, classification report, etc.)
 ###################################
 if __name__ == "__main__":
-    # 数据文件路径
+    # Data file paths
     train_path = "SMM4H-2025-Task5-Train_subtask2.csv"
     val_path = "SMM4H-2025-Task5-Validation_subtask2.csv"
     
-    # 加载并预处理数据
+    # Load and preprocess data
     train_df, val_df = load_data(train_path, val_path)
     train_df = preprocess_dataframe(train_df)
     val_df = preprocess_dataframe(val_df)
     
-    # 转换为 Hugging Face Dataset
+    # Convert to Hugging Face Dataset
     train_dataset = Dataset.from_pandas(train_df)
     val_dataset = Dataset.from_pandas(val_df)
     
     ###################################
-    # 9. 初始化 Tokenizer 与模型（使用 roberta-large）
+    # 9. Initialize Tokenizer and model (using roberta-large)
     ###################################
     model_name = "roberta-large"
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     
-    # 分词和标签对齐（remove_columns 转为 list 以避免错误）
-    train_dataset = train_dataset.map(tokenize_and_align_labels, batched=True, remove_columns=list(train_df.columns))
-    val_dataset = val_dataset.map(tokenize_and_align_labels, batched=True, remove_columns=list(val_df.columns))
+    # Perform tokenization and label alignment on the data, avoiding loading too much data at once (set batch_size parameter)
+    train_dataset = train_dataset.map(tokenize_and_align_labels, batched=True, batch_size=8, remove_columns=list(train_df.columns))
+    val_dataset = val_dataset.map(tokenize_and_align_labels, batched=True, batch_size=8, remove_columns=list(val_df.columns))
     
-    # 计算类别权重（基于训练集 token 层标签分布）
+    # Compute class weights (based on token-level label distribution in the training set)
     class_weights = compute_class_weights(train_dataset, num_labels=len(labels))
     
-    # 加载配置，并实例化自定义模型
+    # Load configuration and instantiate the custom model (enable CRF layer, loss_type="crf")
     config = AutoConfig.from_pretrained(
         model_name,
         num_labels=len(labels),
         id2label=id2label,
-        label2id=label2id
+        label2id=label2id,
+        gradient_checkpointing=True  # Enable gradient checkpointing to reduce memory consumption
     )
     model = AdvancedTokenClassificationModel.from_pretrained(
         model_name,
         config=config,
         class_weights=class_weights,
-        loss_type="crf",      # 使用 CRF 层
+        loss_type="crf",      # Use CRF layer
         gamma=2.0,
         label_smoothing=0.0
     )
     
     ###################################
-    # 10. 定义训练参数与自定义 AdversarialTrainer（未启用早停功能）
+    # 10. Define training parameters and custom AdversarialTrainer
     ###################################
     training_args = TrainingArguments(
         output_dir="./results",
         evaluation_strategy="epoch",
         save_strategy="epoch",
         learning_rate=1e-5,
-        per_device_train_batch_size=8,
-        per_device_eval_batch_size=8,
+        per_device_train_batch_size=4,      # Reduce batch size per device
+        per_device_eval_batch_size=4,
+        gradient_accumulation_steps=2,        # Use gradient accumulation to maintain effective batch size
         num_train_epochs=10,
         weight_decay=0.01,
         warmup_steps=500,
         logging_steps=50,
         save_total_limit=2,
         load_best_model_at_end=True,
-        metric_for_best_model="f1"
+        metric_for_best_model="f1",
+        fp16=True                           # Enable mixed precision training to reduce GPU memory usage
     )
     
     data_collator = DataCollatorForTokenClassification(tokenizer)
+    
+    # Clear the GPU cache before training
+    torch.cuda.empty_cache()
     
     trainer = AdversarialTrainer(
         model=model,
@@ -529,16 +537,16 @@ if __name__ == "__main__":
     )
     
     ###################################
-    # 11. 开始训练与评估（Token-Level 及 Event-Level）
+    # 11. Start training and evaluation (Token-Level and Event-Level)
     ###################################
     trainer.train()
     
-    # Token-Level 评估
+    # Token-Level evaluation
     metrics = trainer.evaluate()
     print("Token-Level Evaluation Metrics:")
     print(metrics)
     
-    # Event-Level Exact Match 评估
+    # Event-Level Exact Match evaluation
     exact_match_count = 0
     total_examples = len(val_df)
     device = model.device
@@ -549,7 +557,7 @@ if __name__ == "__main__":
         inputs = {k: t.to(device) for k, t in inputs.items()}
         with torch.no_grad():
             outputs = model(**inputs)
-        # 若使用 CRF层，预测结果存于 hidden_states 字段
+        # If using the CRF layer, predictions are in the hidden_states field
         if model.loss_type == "crf":
             pred_ids = outputs.hidden_states[0]  # decoded list-of-lists
         else:
@@ -560,7 +568,6 @@ if __name__ == "__main__":
         for token, p in zip(tokens, pred_ids):
             if token in tokenizer.all_special_tokens:
                 continue
-            # 若 p 为整数则转换
             if isinstance(p, int):
                 filtered_preds.append(id2label[p])
             else:
@@ -574,7 +581,7 @@ if __name__ == "__main__":
     print(f"Event-Level Exact Match Rate: {event_exact_match_rate:.4f}")
     
     ###################################
-    # 12. 高级分析：混淆矩阵与分类报告（过滤掉 "O" 标签）
+    # 12. Advanced analysis: Confusion matrix and classification report (filter out the "O" label)
     ###################################
     flat_preds = []
     flat_labels = []
@@ -582,13 +589,11 @@ if __name__ == "__main__":
         batch = {k: v.to(device) for k, v in batch.items()}
         with torch.no_grad():
             outputs = model(**batch)
-        # 根据是否使用 CRF选择预测方式
         if model.loss_type == "crf":
             batch_preds = outputs.hidden_states[0]
         else:
             batch_preds = torch.argmax(outputs.logits, dim=-1).cpu().numpy()
         labels_batch = batch["labels"].cpu().numpy()
-        # 若为 CRF，则 batch_preds 为 list-of-lists
         if isinstance(batch_preds, list):
             for pred_seq, l_seq in zip(batch_preds, labels_batch):
                 for p, l in zip(pred_seq, l_seq):
@@ -633,7 +638,7 @@ if __name__ == "__main__":
     ))
     
     ###################################
-    # 13. 实体级（Chunk-Level） F1 评估（基于 seqeval）
+    # 13. Entity-level (Chunk-Level) F1 evaluation (based on seqeval)
     ###################################
     preds = []
     labels_true = []
@@ -651,7 +656,6 @@ if __name__ == "__main__":
     
     label_seqeval_preds = []
     label_seqeval_trues = []
-    # 判断 preds 是否为 list（即 CRF 输出）或 numpy 数组
     if isinstance(preds, list):
         for pred_seq, label_seq in zip(preds, labels_true):
             pred_labels_str = []
