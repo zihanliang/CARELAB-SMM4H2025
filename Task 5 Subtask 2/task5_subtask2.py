@@ -1,41 +1,139 @@
+# -------------------------------------------------------------------
+# Monkey patch 代码：解决环境中的 TrainingArguments、Trainer、Accelerator 相关问题
+# -------------------------------------------------------------------
+import os
+import sys
+import random
+import json
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+
+# 导入 transformers、accelerate、sklearn 所需模块
+from transformers import TrainingArguments, Trainer, AutoTokenizer, AutoModel
+from transformers.trainer_utils import IntervalStrategy, SaveStrategy
+from accelerate import Accelerator
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support, classification_report
+from sklearn.utils.class_weight import compute_class_weight
+from dataclasses import field
+
+# Monkey patch: 修改 TrainingArguments 的 __init__ 和 __post_init__
+try:
+    _orig_trainargs_init = TrainingArguments.__init__
+    def _patched_trainargs_init(self, *args, **kwargs):
+        self._custom_evaluation_strategy = kwargs.pop("evaluation_strategy", "epoch")
+        self._custom_save_strategy = kwargs.pop("save_strategy", "epoch")
+        if "deepspeed_plugin" in kwargs:
+            kwargs.pop("deepspeed_plugin")
+        return _orig_trainargs_init(self, *args, **kwargs)
+    TrainingArguments.__init__ = _patched_trainargs_init
+
+    def force_trainargs_post_init(self):
+        self.evaluation_strategy = IntervalStrategy.EPOCH
+        self.save_strategy = SaveStrategy.EPOCH
+        if not hasattr(self, "distributed_state"):
+            self.distributed_state = None
+        if not hasattr(self, "deepspeed_plugin"):
+            self.deepspeed_plugin = None
+        if not hasattr(self, "fsdp_config") or self.fsdp_config is None:
+            self.fsdp_config = {"xla": False}
+    TrainingArguments.__post_init__ = force_trainargs_post_init
+
+    print("TrainingArguments monkey patch applied successfully.")
+except Exception as e:
+    print("Error while monkey patching TrainingArguments:", e)
+
+# Monkey patch: Trainer 的 accelerator_config
+try:
+    _orig_trainer_create_accel = Trainer.create_accelerator_and_postprocess
+
+    class DummyAccelConfig:
+        def __init__(self):
+            self.split_batches = False
+            self.dispatch_batches = None
+            self.even_batches = True
+            self.use_seedable_sampler = True
+            self.gradient_accumulation_kwargs = {}  # 必须存在
+            self.non_blocking = False               # 新增属性
+        def to_dict(self):
+            return {
+                "split_batches": self.split_batches,
+                "dispatch_batches": self.dispatch_batches,
+                "even_batches": self.even_batches,
+                "use_seedable_sampler": self.use_seedable_sampler,
+                "gradient_accumulation_kwargs": self.gradient_accumulation_kwargs,
+                "non_blocking": self.non_blocking,
+            }
+
+    def _patched_trainer_create_accel(self):
+        if self.args.accelerator_config is None:
+            self.args.accelerator_config = DummyAccelConfig()
+        return _orig_trainer_create_accel(self)
+    Trainer.create_accelerator_and_postprocess = _patched_trainer_create_accel
+
+    print("Trainer.create_accelerator_and_postprocess monkey patch applied successfully.")
+except Exception as e:
+    print("Error while monkey patching Trainer:", e)
+
+# Monkey patch: Accelerator.__init__
+try:
+    _orig_accelerator_init = Accelerator.__init__
+    def _patched_accelerator_init(self, *args, **kwargs):
+        for key in ["dispatch_batches", "even_batches", "use_seedable_sampler"]:
+            kwargs.pop(key, None)
+        _orig_accelerator_init(self, *args, **kwargs)
+        if not hasattr(self.state, "distributed_type"):
+            from accelerate.state import DistributedType
+            self.state.distributed_type = DistributedType.NO
+    Accelerator.__init__ = _patched_accelerator_init
+    print("Accelerator monkey patch applied successfully.")
+except Exception as e:
+    print("Error while monkey patching Accelerator:", e)
+
+# Monkey patch: AcceleratorState._reset_state（采用 classmethod 形式）
+try:
+    from accelerate.state import AcceleratorState, DistributedType
+    @classmethod
+    def _patched_reset_state(cls, *args, **kwargs):
+        cls.distributed_type = DistributedType.NO
+        cls.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    AcceleratorState._reset_state = _patched_reset_state
+    print("AcceleratorState._reset_state patch applied successfully.")
+except Exception as e:
+    print("Error while patching AcceleratorState._reset_state:", e)
+
+# -------------------------------------------------------------------
+# 以下为模型训练及评估完整代码（使用更大的模型及高级统计学方法提升性能）
+# -------------------------------------------------------------------
 import json
 import pandas as pd
 import numpy as np
-from collections import defaultdict
-import os
-import re
+from collections import defaultdict, Counter
 from tqdm import tqdm
 import torch
-import torch.nn as nn
-from torch.nn import CrossEntropyLoss
+import torch.nn.functional as F
 from transformers import (
-    AutoTokenizer, 
-    AutoModelForTokenClassification, 
-    TrainingArguments, 
-    Trainer, 
-    DataCollatorForTokenClassification,
+    AutoTokenizer,
+    AutoModelForTokenClassification,
     AutoConfig,
-    EarlyStoppingCallback
+    TrainingArguments,
+    Trainer,
+    DataCollatorForTokenClassification
 )
 from datasets import Dataset
 import evaluate
-from sklearn.model_selection import train_test_split
 import matplotlib.pyplot as plt
-from sklearn.metrics import confusion_matrix, classification_report, ConfusionMatrixDisplay
+from sklearn.metrics import confusion_matrix, classification_report
 
-# Enable deterministic behavior for reproducibility
-seed = 42
-torch.manual_seed(seed)
-torch.cuda.manual_seed_all(seed)
-np.random.seed(seed)
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
+# 此处需要安装 torchcrf： pip install pytorch-crf
+from torchcrf import CRF
 
 ###################################
-# 1. Define labels, data loading, and utility functions #
+# 1. 定义标签、数据加载和实用函数
 ###################################
-
-# All entity labels (BIO) + O
 labels = [
     "O", 
     "B-TARGET_ORG", "I-TARGET_ORG", 
@@ -48,7 +146,6 @@ labels = [
 label2id = {label: idx for idx, label in enumerate(labels)}
 id2label = {idx: label for label, idx in label2id.items()}
 
-# Map CSV columns to entity types
 column_to_entity = {
     "organization": "TARGET_ORG",
     "product": "PRODUCT",
@@ -59,887 +156,528 @@ column_to_entity = {
 }
 
 def load_data(train_path, val_path):
-    """Load and prepare the training and validation dataframes."""
     train_df = pd.read_csv(train_path)
     val_df = pd.read_csv(val_path)
-    
-    # Convert affected numbers to strings if they are not already
-    for df in [train_df, val_df]:
-        if 'number_of_people_affected' in df.columns:
-            df['number_of_people_affected'] = df['number_of_people_affected'].astype(str)
-    
     return train_df, val_df
 
 def preprocess_dataframe(df):
-    """Clean and preprocess the dataframe."""
-    # Fill NaN values with empty strings for entity columns
-    for col in column_to_entity.keys():
-        if col in df.columns:
-            df[col] = df[col].fillna('')
-    
-    # Clean text and entity values
-    for col in ['text'] + list(column_to_entity.keys()):
-        if col in df.columns:
-            df[col] = df[col].astype(str).apply(lambda x: x.strip())
-    
+    # 根据需要进行额外的数据清洗，目前直接返回
     return df
 
-def tokenize_text(text):
-    """Simple word tokenization for better entity matching."""
-    # Split by spaces but keep punctuation
-    return re.findall(r'\w+|[^\w\s]', text)
-
-def normalize_text(text):
-    """Normalize text for better entity matching."""
-    text = text.lower()
-    text = re.sub(r'\s+', ' ', text)
-    return text.strip()
-
-def find_entity_spans(text, entity_text):
-    """
-    Find all occurrences of entity_text in text with better fuzzy matching.
-    Returns list of (start, end) tuples.
-    """
-    if not entity_text or entity_text == '' or entity_text.lower() == 'nan':
-        return []
-    
-    # Normalize both text and entity for matching
-    norm_text = normalize_text(text)
-    norm_entity = normalize_text(entity_text)
-    
-    # Direct substring matching
-    spans = []
+def find_all_occurrences(text, substring):
+    """返回文本中所有子串 substring 的起始位置列表"""
+    starts = []
     start = 0
     while True:
-        start = norm_text.find(norm_entity, start)
-        if start == -1:
+        idx = text.find(substring, start)
+        if idx == -1:
             break
-        # Ensure entity boundaries
-        if (start == 0 or not norm_text[start-1].isalnum()) and \
-           (start+len(norm_entity) >= len(norm_text) or not norm_text[start+len(norm_entity)].isalnum()):
-            spans.append((start, start + len(norm_entity)))
-        start += 1
-    
-    # Try alternative matching if no direct match found
-    if not spans and len(norm_entity) > 3:
-        # Try with partial matching for longer entities
-        words = norm_entity.split()
-        if len(words) > 1:
-            # Try matching first few words
-            first_words = ' '.join(words[:min(3, len(words))])
-            start = 0
-            while True:
-                start = norm_text.find(first_words, start)
-                if start == -1:
-                    break
-                # Find the best end position
-                potential_end = min(start + len(norm_entity) + 10, len(norm_text))
-                best_score = 0
-                best_end = start + len(first_words)
-                
-                for end in range(start + len(first_words), potential_end):
-                    if end >= len(norm_text) or not norm_text[end].isalnum():
-                        candidate = norm_text[start:end]
-                        # Compute similarity (simplified)
-                        common_len = len(set(candidate.split()) & set(norm_entity.split()))
-                        score = common_len / max(len(candidate.split()), len(norm_entity.split()))
-                        if score > 0.7 and score > best_score:  # 70% match threshold
-                            best_score = score
-                            best_end = end
-                
-                if best_score > 0:
-                    spans.append((start, best_end))
-                start += 1
-    
-    # Map normalized spans to original text spans
-    original_spans = []
-    for norm_start, norm_end in spans:
-        # Find equivalent positions in original text
-        orig_start = 0
-        orig_norm_pos = 0
-        # Skip spaces and align with normalized text position
-        while orig_norm_pos < norm_start and orig_start < len(text):
-            if normalize_text(text[orig_start:orig_start+1]) != '':
-                orig_norm_pos += 1
-            orig_start += 1
-        
-        # Find end position
-        orig_end = orig_start
-        orig_norm_pos = norm_start
-        while orig_norm_pos < norm_end and orig_end < len(text):
-            if normalize_text(text[orig_end:orig_end+1]) != '':
-                orig_norm_pos += 1
-            orig_end += 1
-        
-        # Adjust end to include full token
-        while orig_end < len(text) and text[orig_end-1].isalnum():
-            orig_end += 1
-            
-        original_spans.append((orig_start, orig_end))
-    
-    return original_spans
+        starts.append(idx)
+        start = idx + 1
+    return starts
 
 def get_entities_from_example(example):
     """
-    Extract entities from example and return their spans and labels.
+    根据 CSV 中每一列（非空）的内容及预定义的列到实体映射关系，
+    返回形如 {"start": 起始位置, "end": 结束位置, "label": 实体类型} 的实体列表
     """
     entities = []
     text = example["text"]
-    
     for col, ent_type in column_to_entity.items():
-        if col in example and example[col] and example[col].strip():
+        if col in example and pd.notna(example[col]):
             ent_text = str(example[col]).strip()
-            if ent_text and ent_text.lower() != 'nan':
-                # Find all occurrences with improved matching
-                spans = find_entity_spans(text, ent_text)
-                for start, end in spans:
+            if ent_text:
+                start_positions = find_all_occurrences(text, ent_text)
+                for st in start_positions:
                     entities.append({
-                        "start": start,
-                        "end": end,
-                        "label": ent_type,
-                        "text": text[start:end]
+                        "start": st,
+                        "end": st + len(ent_text),
+                        "label": ent_type
                     })
-    
-    # Sort entities by start position for consistent processing
-    entities.sort(key=lambda x: x["start"])
     return entities
 
-def data_augmentation(df):
-    """
-    Apply data augmentation techniques to improve model generalization.
-    """
-    augmented_data = []
-    
-    for _, row in df.iterrows():
-        # Create a copy of the original example
-        augmented_data.append(row.to_dict())
-        
-        # Skip augmentation for examples without entities
-        has_entities = False
-        for col in column_to_entity.keys():
-            if col in row and row[col] and str(row[col]).strip() != '' and str(row[col]).lower() != 'nan':
-                has_entities = True
-                break
-        
-        if not has_entities:
-            continue
-            
-        # Entity substitution: Replace entity mentions with synonyms or variations
-        text = row['text']
-        new_text = text
-        
-        for col, ent_type in column_to_entity.items():
-            if col in row and row[col] and str(row[col]).strip() != '' and str(row[col]).lower() != 'nan':
-                entity_text = str(row[col]).strip()
-                
-                # Apply capitalization variation
-                if entity_text[0].islower() and len(entity_text) > 1:
-                    capitalized = entity_text[0].upper() + entity_text[1:]
-                    new_text = new_text.replace(entity_text, capitalized)
-                    
-        # Only add if text was modified
-        if new_text != text:
-            new_row = row.to_dict()
-            new_row['text'] = new_text
-            augmented_data.append(new_row)
-    
-    return pd.DataFrame(augmented_data)
-
-###########################
-# 2. Tokenization & Label Alignment  #
-###########################
-
-def tokenize_and_align_labels(examples, tokenizer):
-    """
-    Tokenize inputs and align labels to tokens.
-    """
-    tokenized_inputs = tokenizer(
-        examples["text"], 
-        truncation=True, 
-        max_length=512,
-        padding="max_length",
-        return_offsets_mapping=True,
-        return_tensors="pt"
-    )
-    
+###################################
+# 2. 分词与标签对齐
+###################################
+def tokenize_and_align_labels(examples):
+    tokenized_inputs = tokenizer(examples["text"], truncation=True, return_offsets_mapping=True)
     all_labels = []
-    
     for i, offsets in enumerate(tokenized_inputs["offset_mapping"]):
         text = examples["text"][i]
-        # Get all entities for the sample from the CSV
-        example = {key: examples[key][i] for key in examples.keys()}
+        example = { key: examples[key][i] for key in examples.keys() }
         entities = get_entities_from_example(example)
-        
-        # Initialize all token labels as "O"
-        labels = [-100] * len(offsets)
-        
-        # Map token offsets to entity labels
-        for j, (start_offset, end_offset) in enumerate(offsets):
-            # Special tokens have offset (0, 0)
-            if start_offset == 0 and end_offset == 0:
-                continue
-                
-            # Find entity that contains this token
-            token_start, token_end = start_offset.item(), end_offset.item()
-            
-            # Default label is "O" (Outside)
-            token_label = "O"
-            
-            for entity in entities:
-                entity_start, entity_end = entity["start"], entity["end"]
-                
-                # Check if token is part of this entity
-                if token_start >= entity_start and token_end <= entity_end:
-                    # Beginning of entity
-                    if token_start == entity_start:
-                        token_label = f"B-{entity['label']}"
-                    # Inside entity
-                    else:
-                        token_label = f"I-{entity['label']}"
-                    break
-            
-            # Store the label ID
-            labels[j] = label2id.get(token_label, label2id["O"])
-        
-        all_labels.append(labels)
-    
+        char_labels = ["O"] * len(text)
+        for ent in entities:
+            start = ent["start"]
+            end = ent["end"]
+            ent_label = ent["label"]
+            if 0 <= start < len(text):
+                char_labels[start] = "B-" + ent_label
+                for j in range(start + 1, end):
+                    if j < len(text):
+                        char_labels[j] = "I-" + ent_label
+        label_ids = []
+        for offset in offsets:
+            if offset is None or offset[0] == offset[1]:
+                label_ids.append(-100)
+            else:
+                label = char_labels[offset[0]]
+                label_ids.append(label2id.get(label, label2id["O"]))
+        all_labels.append(label_ids)
     tokenized_inputs["labels"] = all_labels
+    tokenized_inputs.pop("offset_mapping")
     return tokenized_inputs
 
-###########################
-# 3. Model Architecture   #
-###########################
-
-class EntityExtractionModel(nn.Module):
-    """
-    Enhanced token classification model with CRF layer.
-    """
-    def __init__(self, model_name, num_labels):
-        super(EntityExtractionModel, self).__init__()
-        self.num_labels = num_labels
-        
-        # Load pre-trained transformer
-        self.config = AutoConfig.from_pretrained(
-            model_name,
-            num_labels=num_labels
-        )
-        self.transformer = AutoModelForTokenClassification.from_pretrained(
-            model_name,
-            config=self.config
-        )
-        
-        # Add additional layers
-        hidden_size = self.config.hidden_size
-        self.dropout = nn.Dropout(0.1)
-        self.classifier = nn.Linear(hidden_size, num_labels)
-        
-        # Initialize weights
-        self.init_weights()
-        
-    def init_weights(self):
-        self.classifier.weight.data.normal_(mean=0.0, std=0.02)
-        if self.classifier.bias is not None:
-            self.classifier.bias.data.zero_()
-            
-    def forward(self, input_ids=None, attention_mask=None, token_type_ids=None, 
-                position_ids=None, labels=None, **kwargs):
-        
-        outputs = self.transformer(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            token_type_ids=token_type_ids,
-            position_ids=position_ids,
-            **kwargs
-        )
-        
-        # Get transformer output
-        sequence_output = outputs.logits
-        
-        # Apply additional classification layer
-        sequence_output = self.dropout(sequence_output)
-        logits = self.classifier(sequence_output)
-        
-        loss = None
-        if labels is not None:
-            loss_fct = CrossEntropyLoss()
-            # Only keep active parts of the loss
-            if attention_mask is not None:
-                active_loss = attention_mask.view(-1) == 1
-                active_logits = logits.view(-1, self.num_labels)
-                active_labels = torch.where(
-                    active_loss, 
-                    labels.view(-1), 
-                    torch.tensor(loss_fct.ignore_index).type_as(labels)
-                )
-                loss = loss_fct(active_logits, active_labels)
-            else:
-                loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
-        
-        return outputs._replace(loss=loss) if loss is not None else outputs
-
-###########################
-# 4. Helper Functions for Sequence Labeling   #
-###########################
-
+###################################
+# 3. 序列标注辅助函数
+###################################
 def extract_event(predicted_labels, tokens):
     """
-    Concatenate tokens into entity text and categorize based on BIO labels.
+    根据 BIO 规则将 token 序列拼接为实体，返回形如 {实体类型: [实体文本, ...]} 的字典
     """
     event = defaultdict(list)
     current_entity = None
     current_tokens = []
-    
     for label, token in zip(predicted_labels, tokens):
         if label.startswith("B-"):
-            # If there is an ongoing entity, collect it first
             if current_entity is not None:
-                entity_text = " ".join(current_tokens).replace(" ##", "").replace("##", "")
-                event[current_entity].append(entity_text)
-            
-            # Start new entity
+                event[current_entity].append(" ".join(current_tokens))
             current_entity = label[2:]
             current_tokens = [token]
         elif label.startswith("I-") and current_entity is not None:
-            # Continue current entity
             current_tokens.append(token)
         else:
-            # End of entity or no entity
             if current_entity is not None:
-                entity_text = " ".join(current_tokens).replace(" ##", "").replace("##", "")
-                event[current_entity].append(entity_text)
+                event[current_entity].append(" ".join(current_tokens))
             current_entity = None
             current_tokens = []
-    
-    # Handle entity at end of sequence
     if current_entity is not None:
-        entity_text = " ".join(current_tokens).replace(" ##", "").replace("##", "")
-        event[current_entity].append(entity_text)
-    
-    # Clean up entity text
-    for entity_type in event:
-        cleaned_entities = []
-        for entity_text in event[entity_type]:
-            # Remove special tokens and clean whitespace
-            cleaned = re.sub(r'\s+', ' ', entity_text).strip()
-            if cleaned:
-                cleaned_entities.append(cleaned)
-        event[entity_type] = cleaned_entities
-    
+        event[current_entity].append(" ".join(current_tokens))
     return dict(event)
 
 def convert_gold_to_event(example):
     """
-    Convert gold information into a dict (entity type -> list of entity text).
+    将真实标注转换为 {实体类型: [实体文本, ...]} 格式
     """
     text = example["text"]
     entities = get_entities_from_example(example)
     event = defaultdict(list)
-    
     for ent in entities:
         label = ent["label"]
         start, end = ent["start"], ent["end"]
         ent_text = text[start:end]
         event[label].append(ent_text)
-    
     return dict(event)
 
 def events_exact_match(pred_event, gold_event):
     """
-    Determine if the predicted event exactly matches the gold event.
+    若预测事件与真实事件在实体类型及实体文本集合上完全一致，则返回 True
     """
-    # Compare sets of entity types
     if set(pred_event.keys()) != set(gold_event.keys()):
         return False
-    
-    # For each entity type, compare sets of entity texts
     for key in pred_event:
-        # Normalize predicted and gold entities for comparison
-        pred_entities = set(normalize_text(e) for e in pred_event[key])
-        gold_entities = set(normalize_text(e) for e in gold_event[key])
-        
-        if pred_entities != gold_entities:
+        if set(pred_event[key]) != set(gold_event[key]):
             return False
-    
     return True
 
-def compute_metrics(pred):
-    """
-    Compute token-level and entity-level evaluation metrics.
-    """
-    predictions, labels = pred
-    predictions = np.argmax(predictions, axis=2)
-    
-    # Extract token-level predictions and labels, ignoring padding
+###################################
+# 4. 自定义高级 TokenClassification 模型
+#    支持 CRF 层以及多种损失（"crf", "focal", "ce"）
+###################################
+from transformers.modeling_outputs import TokenClassifierOutput
+
+class AdvancedTokenClassificationModel(AutoModelForTokenClassification):
+    def __init__(self, config):
+        super().__init__(config)
+        # 默认参数，可通过 from_pretrained 时覆盖
+        self.class_weights = torch.ones(config.num_labels)
+        self.loss_type = "crf"  # 默认采用 CRF; 可改为 "focal" 或 "ce"
+        self.gamma = 2.0
+        self.label_smoothing = 0.0
+        # 若使用 CRF，则构建 CRF 层
+        if self.loss_type == "crf":
+            self.crf = CRF(num_tags=config.num_labels, batch_first=True)
+        else:
+            self.crf = None
+
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
+        # 弹出自定义参数，防止传递给父类 __init__
+        class_weights = kwargs.pop("class_weights", None)
+        loss_type = kwargs.pop("loss_type", "crf")
+        gamma = kwargs.pop("gamma", 2.0)
+        label_smoothing = kwargs.pop("label_smoothing", 0.0)
+        model = super(AdvancedTokenClassificationModel, cls).from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
+        # 设置自定义参数
+        model.class_weights = class_weights if class_weights is not None else torch.ones(model.config.num_labels)
+        model.loss_type = loss_type
+        model.gamma = gamma
+        model.label_smoothing = label_smoothing
+        if loss_type == "crf":
+            model.crf = CRF(num_tags=model.config.num_labels, batch_first=True)
+        else:
+            model.crf = None
+        return model
+
+    def forward(self, input_ids=None, attention_mask=None, labels=None, **kwargs):
+        # 调用父类 forward 得到 logits
+        outputs = super().forward(input_ids=input_ids, attention_mask=attention_mask, labels=None, **kwargs)
+        logits = outputs.logits  # shape: (batch_size, seq_len, num_labels)
+        if labels is not None:
+            if self.loss_type == "crf":
+                # 构造 mask：labels != -100
+                mask = labels.ne(-100)
+                # 为避免 CRF 出错，将 ignore_index 部分临时设为0
+                tags = labels.clone()
+                tags[~mask] = 0
+                crf_loss = - self.crf(logits, tags, mask=mask, reduction='mean')
+                return TokenClassifierOutput(loss=crf_loss, logits=logits)
+            else:
+                loss = self.compute_loss(TokenClassifierOutput(logits=logits), labels)
+                return TokenClassifierOutput(loss=loss, logits=logits)
+        else:
+            if self.loss_type == "crf":
+                # 若未传入 labels，则利用 CRF 进行解码
+                mask = attention_mask.bool()
+                decoded_tags = self.crf.decode(logits, mask=mask)
+                # 将解码结果放入 hidden_states 字段，便于后续评价时使用
+                return TokenClassifierOutput(logits=logits, hidden_states=decoded_tags)
+            else:
+                return TokenClassifierOutput(logits=logits)
+
+    def compute_loss(self, model_outputs, labels):
+        logits = model_outputs.logits  # (batch_size, seq_len, num_labels)
+        logits = logits.view(-1, self.num_labels)
+        labels = labels.view(-1)
+        valid_mask = labels.ne(-100)
+        if valid_mask.sum() == 0:
+            return torch.tensor(0.0, device=logits.device)
+        logits = logits[valid_mask]
+        labels = labels[valid_mask]
+        if self.loss_type == "focal":
+            ce_loss = F.cross_entropy(logits, labels, reduction='none', weight=self.class_weights.to(logits.device))
+            pt = torch.exp(-ce_loss)
+            focal_loss = ((1 - pt) ** self.gamma) * ce_loss
+            return focal_loss.mean()
+        elif self.loss_type == "ce":
+            if self.label_smoothing > 0:
+                loss_fct = torch.nn.CrossEntropyLoss(weight=self.class_weights.to(logits.device),
+                                                       ignore_index=-100,
+                                                       label_smoothing=self.label_smoothing)
+            else:
+                loss_fct = torch.nn.CrossEntropyLoss(weight=self.class_weights.to(logits.device),
+                                                       ignore_index=-100)
+            return loss_fct(logits, labels)
+        else:
+            loss_fct = torch.nn.CrossEntropyLoss(weight=self.class_weights.to(logits.device),
+                                                   ignore_index=-100)
+            return loss_fct(logits, labels)
+
+###################################
+# 5. 自定义 Adversarial Trainer（基于 FGM 对抗训练）
+###################################
+class AdversarialTrainer(Trainer):
+    def training_step(self, model, inputs):
+        model.train()
+        inputs = self._prepare_inputs(inputs)
+        # 正常前向计算损失
+        loss = self.compute_loss(model, inputs)
+        loss.backward()
+        # FGM 对抗训练
+        epsilon = 0.5
+        # 假设使用的是 RoBERTa 模型，获取其 word embeddings
+        embed_layer = model.roberta.embeddings.word_embeddings
+        # 备份原参数梯度方向
+        delta = epsilon * torch.sign(embed_layer.weight.grad)
+        embed_layer.weight.data.add_(delta)
+        # 对抗前向，计算对抗性损失
+        adv_loss = self.compute_loss(model, inputs)
+        adv_loss.backward()
+        # 恢复 embeddings 参数
+        embed_layer.weight.data.sub_(delta)
+        # 返回总损失
+        total_loss = loss + adv_loss
+        return total_loss.detach()
+
+###################################
+# 6. 辅助函数：计算类别权重（基于 token 层统计）
+###################################
+def compute_class_weights(dataset, num_labels):
+    counter = Counter()
+    for example in dataset:
+        for label in example["labels"]:
+            if label != -100:
+                counter[label] += 1
+    weights = []
+    for i in range(num_labels):
+        count = counter[i]
+        weights.append(1.0 / count if count > 0 else 1.0)
+    weights = torch.tensor(weights, dtype=torch.float)
+    weights = weights / weights.sum()  # 归一化
+    return weights
+
+###################################
+# 7. 修改 compute_metrics：支持 CRF 解码后的输出
+###################################
+def compute_metrics(p):
+    predictions, labels_true = p
+    # 若预测结果为列表（即 CRF 解码结果），则直接使用；否则进行 argmax
+    if isinstance(predictions, list):
+        true_predictions = predictions
+    else:
+        predictions = np.argmax(predictions, axis=2)
+        true_predictions = []
+        for pred, label in zip(predictions, labels_true):
+            pred_labels = []
+            label_list = []
+            for p_idx, l_idx in zip(pred, label):
+                if l_idx != -100:
+                    pred_labels.append(id2label[p_idx])
+                    label_list.append(id2label[l_idx])
+            true_predictions.append(pred_labels)
     true_labels = []
-    true_predictions = []
-    
-    for prediction, label in zip(predictions, labels):
-        true_pred = []
-        true_label = []
-        
-        for p, l in zip(prediction, label):
-            if l != -100:  # Ignore padded tokens
-                true_pred.append(id2label[p])
-                true_label.append(id2label[l])
-        
-        true_labels.append(true_label)
-        true_predictions.append(true_pred)
-    
-    # Compute seqeval metrics
+    for label in labels_true:
+        label_list = []
+        for l in label:
+            if l != -100:
+                label_list.append(id2label[l])
+        true_labels.append(label_list)
     seqeval_metric = evaluate.load("seqeval")
-    results = seqeval_metric.compute(
-        predictions=true_predictions, 
-        references=true_labels,
-        scheme="BIO"
-    )
-    
-    # Extract metrics of interest
-    metrics = {
-        "precision": results["overall_precision"],
-        "recall": results["overall_recall"],
-        "f1": results["overall_f1"],
-        "accuracy": results["overall_accuracy"]
+    results = seqeval_metric.compute(predictions=true_predictions, references=true_labels)
+    return {
+         "precision": results["overall_precision"],
+         "recall": results["overall_recall"],
+         "f1": results["overall_f1"],
+         "accuracy": results["overall_accuracy"],
     }
-    
-    # Add per-entity type F1 scores
-    for entity_type in results.keys():
-        if isinstance(results[entity_type], dict) and 'f1' in results[entity_type]:
-            metrics[f"{entity_type}_f1"] = results[entity_type]['f1']
-    
-    return metrics
 
-def evaluate_predictions(model, tokenizer, dataset, device):
-    """
-    Evaluate model predictions on a dataset.
-    """
-    model.eval()
-    all_predictions = []
-    all_labels = []
-    
-    for example in tqdm(dataset, desc="Evaluating"):
-        # Tokenize input
-        inputs = tokenizer(
-            example["text"], 
-            return_tensors="pt", 
-            truncation=True, 
-            max_length=512,
-            return_offsets_mapping=True
-        )
-        
-        # Get offsets for token-to-character mapping
-        offsets = inputs.pop("offset_mapping")[0]
-        
-        # Move to device
-        inputs = {k: v.to(device) for k, t in inputs.items()}
-        
-        # Generate predictions
-        with torch.no_grad():
-            outputs = model(**inputs)
-        
-        # Get predicted labels
-        predictions = torch.argmax(outputs.logits, dim=2)[0].cpu().numpy()
-        
-        # Convert token IDs to original tokens
-        tokens = tokenizer.convert_ids_to_tokens(inputs["input_ids"][0])
-        
-        # Filter out special tokens
-        filtered_tokens = []
-        filtered_predictions = []
-        for token, pred, offset in zip(tokens, predictions, offsets):
-            # Skip special tokens (CLS, SEP, PAD)
-            if offset[0] == offset[1]:
-                continue
-            filtered_tokens.append(token)
-            filtered_predictions.append(id2label[pred])
-        
-        # Extract entities from predictions
-        pred_event = extract_event(filtered_predictions, filtered_tokens)
-        
-        # Get gold entities
-        gold_event = convert_gold_to_event(example)
-        
-        all_predictions.append(pred_event)
-        all_labels.append(gold_event)
-    
-    return all_predictions, all_labels
-
-def compute_event_level_metrics(predictions, labels):
-    """
-    Compute event-level evaluation metrics.
-    """
-    # Exact match count
-    exact_matches = 0
-    for pred, gold in zip(predictions, labels):
-        if events_exact_match(pred, gold):
-            exact_matches += 1
-    
-    exact_match_rate = exact_matches / len(predictions)
-    
-    # Entity type presence accuracy
-    entity_type_correct = defaultdict(int)
-    entity_type_total = defaultdict(int)
-    
-    for pred, gold in zip(predictions, labels):
-        # For each entity type in gold
-        for entity_type in set(gold.keys()):
-            entity_type_total[entity_type] += 1
-            # Check if entity type is in pred
-            if entity_type in pred:
-                entity_type_correct[entity_type] += 1
-    
-    # Entity value accuracy (partial match)
-    entity_value_correct = defaultdict(int)
-    
-    for pred, gold in zip(predictions, labels):
-        # For each entity type in gold
-        for entity_type in gold.keys():
-            if entity_type in pred:
-                # Normalize entity values
-                pred_values = set(normalize_text(v) for v in pred[entity_type])
-                gold_values = set(normalize_text(v) for v in gold[entity_type])
-                
-                # Count matches
-                if pred_values == gold_values:
-                    entity_value_correct[entity_type] += 1
-    
-    # Calculate metrics
-    metrics = {
-        "exact_match_rate": exact_match_rate,
-    }
-    
-    # Add type-level metrics
-    for entity_type in entity_type_total:
-        total = entity_type_total[entity_type]
-        correct_type = entity_type_correct[entity_type]
-        correct_value = entity_value_correct[entity_type]
-        
-        metrics[f"{entity_type}_type_accuracy"] = correct_type / total if total > 0 else 0
-        metrics[f"{entity_type}_value_accuracy"] = correct_value / total if total > 0 else 0
-    
-    return metrics
-
-########################################
-# 5. Main Process: Training and Evaluation
-########################################
-
-def main():
-    # Data paths
-    global labels
+###################################
+# 8. 主流程：训练、评估与高级分析（混淆矩阵、分类报告等）
+###################################
+if __name__ == "__main__":
+    # 数据文件路径
     train_path = "SMM4H-2025-Task5-Train_subtask2.csv"
     val_path = "SMM4H-2025-Task5-Validation_subtask2.csv"
-
-    # Model configuration
-    model_name = "microsoft/deberta-v3-large"  # Upgraded from BERT
-    batch_size = 8
-    learning_rate = 2e-5
-    epochs = 10
-    warmup_steps = 0.1  # 10% of training steps
-    output_dir = "./results_deberta_large"
     
-    # Create output directory
-    os.makedirs(output_dir, exist_ok=True)
-
-    # Load and preprocess data
-    print("Loading and preprocessing data...")
+    # 加载并预处理数据
     train_df, val_df = load_data(train_path, val_path)
     train_df = preprocess_dataframe(train_df)
     val_df = preprocess_dataframe(val_df)
     
-    # Apply data augmentation to training data
-    print("Applying data augmentation...")
-    train_df = data_augmentation(train_df)
-    
-    # Convert to Hugging Face Dataset
+    # 转换为 Hugging Face Dataset
     train_dataset = Dataset.from_pandas(train_df)
     val_dataset = Dataset.from_pandas(val_df)
-
-    # Initialize tokenizer
-    print(f"Loading tokenizer: {model_name}")
-    tokenizer = AutoTokenizer.from_pretrained("microsoft/deberta-v3-large", use_fast=True)
     
-    # Tokenize data & align labels
-    print("Tokenizing and aligning labels...")
-    tokenize_fn = lambda examples: tokenize_and_align_labels(examples, tokenizer)
-    train_dataset = train_dataset.map(tokenize_fn, batched=True)
-    val_dataset = val_dataset.map(tokenize_fn, batched=True)
-
-    # Set format for pytorch
-    train_dataset.set_format("torch", columns=["input_ids", "attention_mask", "labels", "text"])
-    val_dataset.set_format("torch", columns=["input_ids", "attention_mask", "labels", "text"])
-
-    # Calculate training steps for scheduler
-    total_steps = (len(train_dataset) // batch_size) * epochs
-    warmup_steps = int(total_steps * warmup_steps)
+    ###################################
+    # 9. 初始化 Tokenizer 与模型（使用 roberta-large）
+    ###################################
+    model_name = "roberta-large"
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
     
-    # Define training parameters
-    training_args = TrainingArguments(
-        output_dir=output_dir,
-        learning_rate=learning_rate,
-        per_device_train_batch_size=batch_size,
-        per_device_eval_batch_size=batch_size,
-        num_train_epochs=epochs,
-        weight_decay=0.01,
-        logging_steps=100,
-        save_total_limit=1,
-        load_best_model_at_end=False,  # 关闭自动选择最佳模型
-        metric_for_best_model="f1",
-        warmup_steps=warmup_steps,
-        seed=seed,
-        gradient_accumulation_steps=2,
-        fp16=True,
-        report_to="none",
-    )
-
-    # Initialize model (could use custom architecture)
-    print(f"Loading model: {model_name}")
-    model = AutoModelForTokenClassification.from_pretrained(
+    # 分词和标签对齐（remove_columns 转为 list 以避免错误）
+    train_dataset = train_dataset.map(tokenize_and_align_labels, batched=True, remove_columns=list(train_df.columns))
+    val_dataset = val_dataset.map(tokenize_and_align_labels, batched=True, remove_columns=list(val_df.columns))
+    
+    # 计算类别权重（基于训练集 token 层标签分布）
+    class_weights = compute_class_weights(train_dataset, num_labels=len(labels))
+    
+    # 加载配置，并实例化自定义模型
+    config = AutoConfig.from_pretrained(
         model_name,
         num_labels=len(labels),
         id2label=id2label,
         label2id=label2id
     )
-
-    # Dynamic padding
-    data_collator = DataCollatorForTokenClassification(tokenizer)
-
-    # Early stopping callback
-    early_stopping = EarlyStoppingCallback(
-        early_stopping_patience=3,
-        early_stopping_threshold=0.001
+    model = AdvancedTokenClassificationModel.from_pretrained(
+        model_name,
+        config=config,
+        class_weights=class_weights,
+        loss_type="crf",      # 使用 CRF 层
+        gamma=2.0,
+        label_smoothing=0.0
     )
     
-    # Construct Trainer
-    trainer = Trainer(
+    ###################################
+    # 10. 定义训练参数与自定义 AdversarialTrainer（未启用早停功能）
+    ###################################
+    training_args = TrainingArguments(
+        output_dir="./results",
+        evaluation_strategy="epoch",
+        save_strategy="epoch",
+        learning_rate=1e-5,
+        per_device_train_batch_size=8,
+        per_device_eval_batch_size=8,
+        num_train_epochs=10,
+        weight_decay=0.01,
+        warmup_steps=500,
+        logging_steps=50,
+        save_total_limit=2,
+        load_best_model_at_end=True,
+        metric_for_best_model="f1"
+    )
+    
+    data_collator = DataCollatorForTokenClassification(tokenizer)
+    
+    trainer = AdversarialTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
         compute_metrics=compute_metrics,
         tokenizer=tokenizer,
-        data_collator=data_collator,
+        data_collator=data_collator
     )
-
-    # Start training
-    print("Starting training...")
+    
+    ###################################
+    # 11. 开始训练与评估（Token-Level 及 Event-Level）
+    ###################################
     trainer.train()
-
-    # Print token-level evaluation
+    
+    # Token-Level 评估
     metrics = trainer.evaluate()
-    print("\nToken-level Evaluation Metrics:")
-    for key, value in metrics.items():
-        print(f"{key}: {value:.4f}")
-
-    # Event-level exact match evaluation
-    print("\nPerforming event-level evaluation...")
+    print("Token-Level Evaluation Metrics:")
+    print(metrics)
+    
+    # Event-Level Exact Match 评估
+    exact_match_count = 0
+    total_examples = len(val_df)
     device = model.device
+    for i in tqdm(range(total_examples), desc="Evaluating event extraction"):
+        example = val_df.iloc[i]
+        text = example["text"]
+        inputs = tokenizer(text, return_tensors="pt", truncation=True)
+        inputs = {k: t.to(device) for k, t in inputs.items()}
+        with torch.no_grad():
+            outputs = model(**inputs)
+        # 若使用 CRF层，预测结果存于 hidden_states 字段
+        if model.loss_type == "crf":
+            pred_ids = outputs.hidden_states[0]  # decoded list-of-lists
+        else:
+            pred_ids = torch.argmax(outputs.logits, dim=2)[0].cpu().numpy().tolist()
+        tokens = tokenizer.convert_ids_to_tokens(inputs["input_ids"][0])
+        filtered_tokens = []
+        filtered_preds = []
+        for token, p in zip(tokens, pred_ids):
+            if token in tokenizer.all_special_tokens:
+                continue
+            # 若 p 为整数则转换
+            if isinstance(p, int):
+                filtered_preds.append(id2label[p])
+            else:
+                filtered_preds.append(id2label[p])
+            filtered_tokens.append(token)
+        pred_event = extract_event(filtered_preds, filtered_tokens)
+        gold_event = convert_gold_to_event(example)
+        if events_exact_match(pred_event, gold_event):
+            exact_match_count += 1
+    event_exact_match_rate = exact_match_count / total_examples
+    print(f"Event-Level Exact Match Rate: {event_exact_match_rate:.4f}")
     
-    # Generate predictions and gold labels
-    all_predictions, all_gold_labels = evaluate_predictions(
-        model, tokenizer, val_dataset, device
-    )
-    
-    # Compute event-level metrics
-    event_metrics = compute_event_level_metrics(all_predictions, all_gold_labels)
-    
-    print("\nEvent-level Metrics:")
-    for key, value in event_metrics.items():
-        print(f"{key}: {value:.4f}")
-    
-    # Advanced Analysis: Confusion Matrix
-    print("\nGenerating confusion matrix...")
+    ###################################
+    # 12. 高级分析：混淆矩阵与分类报告（过滤掉 "O" 标签）
+    ###################################
     flat_preds = []
     flat_labels = []
-    
     for batch in trainer.get_eval_dataloader():
         batch = {k: v.to(device) for k, v in batch.items()}
         with torch.no_grad():
             outputs = model(**batch)
-        
-        predictions = outputs.logits.argmax(dim=-1).cpu().numpy()
-        labels = batch["labels"].cpu().numpy()
-        
-        for p, l in zip(predictions, labels):
-            for pred_id, label_id in zip(p, l):
-                if label_id != -100:  # Ignore padding tokens
-                    flat_preds.append(pred_id)
-                    flat_labels.append(label_id)
-
-    # Filter out O-O pairs for better visibility
+        # 根据是否使用 CRF选择预测方式
+        if model.loss_type == "crf":
+            batch_preds = outputs.hidden_states[0]
+        else:
+            batch_preds = torch.argmax(outputs.logits, dim=-1).cpu().numpy()
+        labels_batch = batch["labels"].cpu().numpy()
+        # 若为 CRF，则 batch_preds 为 list-of-lists
+        if isinstance(batch_preds, list):
+            for pred_seq, l_seq in zip(batch_preds, labels_batch):
+                for p, l in zip(pred_seq, l_seq):
+                    if l != -100:
+                        flat_preds.append(p)
+                        flat_labels.append(l)
+        else:
+            for p_seq, l_seq in zip(batch_preds, labels_batch):
+                for p, l in zip(p_seq, l_seq):
+                    if l != -100:
+                        flat_preds.append(p)
+                        flat_labels.append(l)
     filtered_preds, filtered_labels = [], []
     o_id = label2id["O"]
-    
     for p, l in zip(flat_preds, flat_labels):
         if p != o_id and l != o_id:
             filtered_preds.append(p)
             filtered_labels.append(l)
+    ALL_LABELS = [
+        "O", 
+        "B-TARGET_ORG", "I-TARGET_ORG", 
+        "B-PRODUCT", "I-PRODUCT", 
+        "B-INFECTION", "I-INFECTION", 
+        "B-SAFETY_INCIDENT", "I-SAFETY_INCIDENT", 
+        "B-AFFECTED_NUM", "I-AFFECTED_NUM",
+        "B-LOCATION", "I-LOCATION"
+    ]
+    entity_only = [lab for lab in ALL_LABELS if lab != "O"]
+    entity_ids = [label2id[lab] for lab in entity_only]
     
-    # Get entity-only labels
-    entity_labels = [label for label in labels if label != "O"]
-    entity_ids = [label2id[label] for label in entity_labels]
+    cm_entities = confusion_matrix(filtered_labels, filtered_preds, labels=entity_ids)
+    print("\nConfusion Matrix (Gold, Pred ≠ O):")
+    print(cm_entities)
     
-    # Compute confusion matrix (excluding O)
-    if filtered_preds and filtered_labels:
-        cm = confusion_matrix(filtered_labels, filtered_preds, labels=entity_ids)
-        
-        # Plot confusion matrix
-        plt.figure(figsize=(12, 10))
-        disp = ConfusionMatrixDisplay(
-            confusion_matrix=cm,
-            display_labels=entity_labels
-        )
-        disp.plot(cmap="Blues", xticks_rotation=45)
-        plt.title("Confusion Matrix (Gold,Pred ≠ O)")
-        plt.tight_layout()
-        plt.savefig(os.path.join(output_dir, "confusion_matrix.png"))
-        
-        # Print classification report
-        print("\nClassification Report (Gold,Pred ≠ O):")
-        report = classification_report(
-            filtered_labels,
-            filtered_preds,
-            labels=entity_ids,
-            target_names=entity_labels,
-            zero_division=0
-        )
-        print(report)
-        
-        # Save report to file
-        with open(os.path.join(output_dir, "classification_report.txt"), "w") as f:
-            f.write(report)
+    print("\nClassification Report (Gold, Pred ≠ O):")
+    print(classification_report(
+        filtered_labels,
+        filtered_preds,
+        labels=entity_ids,
+        target_names=entity_only,
+        zero_division=0
+    ))
     
-    # Error analysis
-    print("\nPerforming error analysis...")
-    error_analysis = []
-    
-    for i, (pred_event, gold_event) in enumerate(zip(all_predictions, all_gold_labels)):
-        example = val_df.iloc[i]
-        text = example["text"]
-        
-        if not events_exact_match(pred_event, gold_event):
-            # Create analysis entry
-            analysis = {
-                "text": text,
-                "gold": gold_event,
-                "pred": pred_event,
-                "errors": []
-            }
-            
-# Analyze errors
-            # Check for missing entity types
-            for entity_type in gold_event:
-                if entity_type not in pred_event:
-                    analysis["errors"].append(f"Missing entity type: {entity_type}")
-                    
-            # Check for extra entity types
-            for entity_type in pred_event:
-                if entity_type not in gold_event:
-                    analysis["errors"].append(f"Extra entity type: {entity_type}")
-            
-            # Check for value mismatches
-            for entity_type in set(gold_event.keys()) & set(pred_event.keys()):
-                gold_values = set(normalize_text(v) for v in gold_event[entity_type])
-                pred_values = set(normalize_text(v) for v in pred_event[entity_type])
-                
-                # Missing values
-                for value in gold_values - pred_values:
-                    analysis["errors"].append(f"Missing {entity_type} value: {value}")
-                
-                # Extra values
-                for value in pred_values - gold_values:
-                    analysis["errors"].append(f"Extra {entity_type} value: {value}")
-            
-            error_analysis.append(analysis)
-    
-    # Save error analysis to file
-    if error_analysis:
-        with open(os.path.join(output_dir, "error_analysis.json"), "w") as f:
-            json.dump(error_analysis, f, indent=2)
-        
-        # Print sample errors
-        print("\nSample error cases:")
-        for i, analysis in enumerate(error_analysis[:5]):  # Show first 5 errors
-            print(f"\nError case {i+1}:")
-            print(f"Text: {analysis['text'][:100]}...")
-            print(f"Gold: {analysis['gold']}")
-            print(f"Pred: {analysis['pred']}")
-            print(f"Errors: {analysis['errors']}")
-    
-    # Save model and tokenizer
-    output_model_dir = os.path.join(output_dir, "best_model")
-    os.makedirs(output_model_dir, exist_ok=True)
-    model.save_pretrained(output_model_dir)
-    tokenizer.save_pretrained(output_model_dir)
-    
-    print(f"\nTraining completed. Best model saved to {output_model_dir}")
-    
-    # Generate and save predictions for validation set
-    predictions = []
-    
-    for i, example in enumerate(tqdm(val_df.iterrows(), desc="Generating predictions", total=len(val_df))):
-        _, row = example
-        text = row["text"]
-        
-        # Tokenize
-        inputs = tokenizer(
-            text, 
-            return_tensors="pt", 
-            truncation=True, 
-            max_length=512,
-            return_offsets_mapping=True
-        )
-        offsets = inputs.pop("offset_mapping")[0]
-        
-        # Get predictions
-        inputs = {k: v.to(device) for k, v in inputs.items()}
+    ###################################
+    # 13. 实体级（Chunk-Level） F1 评估（基于 seqeval）
+    ###################################
+    preds = []
+    labels_true = []
+    for batch in trainer.get_eval_dataloader():
+        batch = {k: v.to(device) for k, v in batch.items()}
         with torch.no_grad():
-            outputs = model(**inputs)
-        
-        predictions_idx = torch.argmax(outputs.logits, dim=2)[0].cpu().numpy()
-        
-        # Map to tokens and labels
-        tokens = tokenizer.convert_ids_to_tokens(inputs["input_ids"][0])
-        filtered_tokens = []
-        filtered_predictions = []
-        
-        for token, pred_id, offset in zip(tokens, predictions_idx, offsets):
-            if offset[0] == offset[1]:  # Special token
-                continue
-            filtered_tokens.append(token)
-            filtered_predictions.append(id2label[pred_id])
-        
-        # Extract entities
-        pred_event = extract_event(filtered_predictions, filtered_tokens)
-        
-        # Create prediction entry
-        prediction = {
-            "docid": row["docid"] if "docid" in row else i,
-            "text": text,
-        }
-        
-        # Add extracted entities
-        for entity_type, entity_key in {
-            "TARGET_ORG": "organization",
-            "PRODUCT": "product",
-            "SAFETY_INCIDENT": "cause",
-            "INFECTION": "disease",
-            "AFFECTED_NUM": "number_of_people_affected",
-            "LOCATION": "location"
-        }.items():
-            if entity_type in pred_event and pred_event[entity_type]:
-                # Use first entity as prediction (can be modified based on confidence)
-                prediction[entity_key] = pred_event[entity_type][0]
-            else:
-                prediction[entity_key] = ""
-        
-        predictions.append(prediction)
+            outputs = model(**batch)
+        if model.loss_type == "crf":
+            batch_preds = outputs.hidden_states[0]
+        else:
+            batch_preds = torch.argmax(outputs.logits, dim=-1).cpu().numpy()
+        labels_batch = batch["labels"].cpu().numpy()
+        preds.extend(batch_preds)
+        labels_true.extend(labels_batch)
     
-    # Save predictions to CSV
-    predictions_df = pd.DataFrame(predictions)
-    predictions_df.to_csv(os.path.join(output_dir, "predictions.csv"), index=False)
-    
-    print(f"Predictions saved to {os.path.join(output_dir, 'predictions.csv')}")
-    
-    return model, tokenizer, metrics, event_metrics
-
-if __name__ == "__main__":
-    main()
+    label_seqeval_preds = []
+    label_seqeval_trues = []
+    # 判断 preds 是否为 list（即 CRF 输出）或 numpy 数组
+    if isinstance(preds, list):
+        for pred_seq, label_seq in zip(preds, labels_true):
+            pred_labels_str = []
+            gold_labels_str = []
+            for p, l in zip(pred_seq, label_seq):
+                if l == -100:
+                    continue
+                pred_labels_str.append(id2label[p])
+                gold_labels_str.append(id2label[l])
+            label_seqeval_preds.append(pred_labels_str)
+            label_seqeval_trues.append(gold_labels_str)
+    else:
+        for pred_seq, label_seq in zip(preds, labels_true):
+            pred_labels_str = []
+            gold_labels_str = []
+            for p, l in zip(pred_seq, label_seq):
+                if l == -100:
+                    continue
+                pred_labels_str.append(id2label[p])
+                gold_labels_str.append(id2label[l])
+            label_seqeval_preds.append(pred_labels_str)
+            label_seqeval_trues.append(gold_labels_str)
+    seqeval_metric = evaluate.load("seqeval")
+    chunk_results = seqeval_metric.compute(
+        predictions=label_seqeval_preds,
+        references=label_seqeval_trues
+    )
+    print("\nChunk-Level (Entity-Level) Seqeval Results:")
+    print(chunk_results)
