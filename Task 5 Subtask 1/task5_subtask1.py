@@ -1,5 +1,3 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
 """
 Advanced Food Safety Article Classification Model with Enhanced Neither Training Data:
 - Significantly improved "Neither" class detection using specialized techniques and additional augmented data
@@ -24,9 +22,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
-# -------------------------------------------------------------------
-# 导入 transformers、accelerate、sklearn 所需模块
-# -------------------------------------------------------------------
 from transformers import TrainingArguments, Trainer, AutoTokenizer, AutoModel, EarlyStoppingCallback
 from transformers.trainer_utils import IntervalStrategy, SaveStrategy
 from accelerate import Accelerator
@@ -34,14 +29,8 @@ from sklearn.metrics import accuracy_score, precision_recall_fscore_support, cla
 from sklearn.utils.class_weight import compute_class_weight
 from dataclasses import field
 
-# -------------------------------------------------------------------
-# Monkey patch: 修改 TrainingArguments 的 __init__ 和 __post_init__
-# -------------------------------------------------------------------
 try:
-    # 保存原始 __init__ 方法，同时弹出 evaluation_strategy 和 save_strategy 参数，不传递给原始 __init__
-    _orig_trainargs_init = TrainingArguments.__init__
     def _patched_trainargs_init(self, *args, **kwargs):
-        # 弹出 evaluation_strategy 和 save_strategy 参数，保存到私有属性，避免传入原始 __init__
         self._custom_evaluation_strategy = kwargs.pop("evaluation_strategy", "epoch")
         self._custom_save_strategy = kwargs.pop("save_strategy", "epoch")
         if "deepspeed_plugin" in kwargs:
@@ -49,13 +38,10 @@ try:
         return _orig_trainargs_init(self, *args, **kwargs)
     TrainingArguments.__init__ = _patched_trainargs_init
 
-    # 强制覆盖 __post_init__，直接将 evaluation_strategy 和 save_strategy 固定为 epoch
     def force_trainargs_post_init(self):
-        # 无论 load_best_model_at_end 与否，统一将策略设置为 epoch，满足 EarlyStoppingCallback 要求
         self.evaluation_strategy = IntervalStrategy.EPOCH
         self.save_strategy = SaveStrategy.EPOCH
 
-        # 确保其它必要属性存在
         if not hasattr(self, "distributed_state"):
             self.distributed_state = None
         if not hasattr(self, "deepspeed_plugin"):
@@ -80,8 +66,8 @@ try:
             self.dispatch_batches = None
             self.even_batches = True
             self.use_seedable_sampler = True
-            self.gradient_accumulation_kwargs = {}  # 必须存在
-            self.non_blocking = False               # 新增属性
+            self.gradient_accumulation_kwargs = {}
+            self.non_blocking = False
         def to_dict(self):
             return {
                 "split_batches": self.split_batches,
