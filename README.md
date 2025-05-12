@@ -16,7 +16,7 @@ Our systems cover both classification and span-level extraction tasks, combining
 ```
 
 ### Citation request ###
-If you use the code of this repository in your research, please consider citing the folowing papers:
+If you use the code of this repository in your research, please consider citing the following paper:
 
 Zihan Liang*, Ziwen Pan*, Sumon Kanti Dey, Azra Ismail
 ```
